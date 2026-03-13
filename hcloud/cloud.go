@@ -195,7 +195,14 @@ func (c *cloud) LoadBalancer() (cloudprovider.LoadBalancer, bool) {
 		Recorder:      c.recorder,
 	}
 
-	return newLoadBalancers(lbOps, &c.cfg.LoadBalancer), true
+	fipOps := &hcops.FloatingIPOps{
+		FIPClient:    &c.client.FloatingIP,
+		ActionClient: &c.client.Action,
+		ServerClient: &c.client.Server,
+		Recorder:     c.recorder,
+	}
+
+	return newLoadBalancers(lbOps, &c.cfg.LoadBalancer, fipOps), true
 }
 
 func (c *cloud) Clusters() (cloudprovider.Clusters, bool) {

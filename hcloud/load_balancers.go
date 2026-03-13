@@ -31,14 +31,16 @@ type LoadBalancerOps interface {
 }
 
 type loadBalancers struct {
-	lbOps LoadBalancerOps
-	cfg   *config.LoadBalancerConfiguration
+	lbOps  LoadBalancerOps
+	fipOps FloatingIPOps
+	cfg    *config.LoadBalancerConfiguration
 }
 
-func newLoadBalancers(lbOps LoadBalancerOps, lbCfg *config.LoadBalancerConfiguration) *loadBalancers {
+func newLoadBalancers(lbOps LoadBalancerOps, lbCfg *config.LoadBalancerConfiguration, fipOps FloatingIPOps) *loadBalancers {
 	return &loadBalancers{
-		lbOps: lbOps,
-		cfg:   lbCfg,
+		lbOps:  lbOps,
+		fipOps: fipOps,
+		cfg:    lbCfg,
 	}
 }
 
@@ -65,11 +67,67 @@ func matchNodeSelector(svc *corev1.Service, nodes []*corev1.Node) ([]*corev1.Nod
 	return selectedNodes, nil
 }
 
+// loadBalancerEnabled returns false if the service has the load balancer
+// enabled annotation set to "false" (e.g. to use only Floating IPs). Default is true.
+func loadBalancerEnabled(svc *corev1.Service) bool {
+	enabled, err := annotation.LBEnabled.BoolFromService(svc)
+	if errors.Is(err, annotation.ErrNotSet) {
+		return true
+	}
+	if err != nil {
+		return true
+	}
+	return enabled
+}
+
+// deleteExistingLoadBalancerIfPresent finds an HCloud Load Balancer owned by
+// this service (by UID or by default name) and deletes it if not protected.
+// Used when the service has load-balancer.hetzner.cloud/enabled="false" so
+// the LB is removed after the user switches to FIP-only.
+func (l *loadBalancers) deleteExistingLoadBalancerIfPresent(ctx context.Context, op, clusterName string, svc *corev1.Service) error {
+	lb, err := l.lbOps.GetByK8SServiceUID(ctx, svc)
+	if errors.Is(err, hcops.ErrNotFound) {
+		lbName := l.GetLoadBalancerName(ctx, clusterName, svc)
+		lb, err = l.lbOps.GetByName(ctx, lbName)
+		if errors.Is(err, hcops.ErrNotFound) {
+			klog.InfoS("no existing load balancer found for service (enabled=false)", "op", op, "service", svc.Namespace+"/"+svc.Name, "lbName", lbName)
+			return nil
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	if lb.Protection.Delete {
+		klog.InfoS("ignored: load balancer deletion protected", "op", op, "loadBalancerID", lb.ID)
+		return nil
+	}
+	klog.InfoS("delete Load Balancer (service has load balancer enabled=false)", "op", op, "loadBalancerID", lb.ID, "service", svc.Namespace+"/"+svc.Name)
+	if err := l.lbOps.Delete(ctx, lb); err != nil && !errors.Is(err, hcops.ErrNotFound) {
+		return fmt.Errorf("%s: delete load balancer: %w", op, err)
+	}
+	return nil
+}
+
 func (l *loadBalancers) GetLoadBalancer(
 	ctx context.Context, _ string, service *corev1.Service,
 ) (status *corev1.LoadBalancerStatus, exists bool, err error) {
 	const op = "hcloud/loadBalancers.GetLoadBalancer"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
+
+	if !loadBalancerEnabled(service) {
+		// No HCloud LB; report status from hostname or Floating IPs only.
+		if v, ok := annotation.LBHostname.StringFromService(service); ok {
+			return &corev1.LoadBalancerStatus{
+				Ingress: []corev1.LoadBalancerIngress{{Hostname: v}},
+			}, true, nil
+		}
+		var fips []*hcloud.FloatingIP
+		if l.fipOps != nil && hcops.FloatingIPEnabled(service) {
+			fips, _ = l.fipOps.GetAllByK8SServiceUID(ctx, service)
+		}
+		ingress := buildIngressFromFIPsOnly(fips, service)
+		return &corev1.LoadBalancerStatus{Ingress: ingress}, len(ingress) > 0, nil
+	}
 
 	lb, err := l.lbOps.GetByK8SServiceUID(ctx, service)
 	if err != nil {
@@ -85,7 +143,11 @@ func (l *loadBalancers) GetLoadBalancer(
 		}, true, nil
 	}
 
-	ingress, err := l.buildLoadBalancerStatusIngress(lb, service)
+	var fips []*hcloud.FloatingIP
+	if l.fipOps != nil && hcops.FloatingIPEnabled(service) {
+		fips, _ = l.fipOps.GetAllByK8SServiceUID(ctx, service)
+	}
+	ingress, err := l.buildLoadBalancerStatusIngress(lb, service, fips)
 	if err != nil {
 		return nil, false, fmt.Errorf("%s: %w", op, err)
 	}
@@ -106,17 +168,43 @@ func (l *loadBalancers) EnsureLoadBalancer(
 	const op = "hcloud/loadBalancers.EnsureLoadBalancer"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
 
-	var (
-		reload        bool
-		lb            *hcloud.LoadBalancer
-		err           error
-		selectedNodes []*corev1.Node
-	)
-
-	selectedNodes, err = matchNodeSelector(svc, nodes)
+	selectedNodes, err := matchNodeSelector(svc, nodes)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
+
+	if !loadBalancerEnabled(svc) {
+		klog.InfoS("service has load balancer disabled (enabled=false), managing Floating IPs only", "op", op, "service", svc.Namespace+"/"+svc.Name)
+		// No HCloud LB; delete any existing one we created (e.g. user switched to FIP-only).
+		if err := l.deleteExistingLoadBalancerIfPresent(ctx, op, clusterName, svc); err != nil {
+			return nil, err
+		}
+		// Only handle Floating IPs and return status from them or hostname.
+		var fips []*hcloud.FloatingIP
+		if hcops.FloatingIPEnabled(svc) {
+			var ensureErr error
+			fips, ensureErr = l.ensureFloatingIPs(ctx, op, svc, selectedNodes)
+			if ensureErr != nil {
+				return nil, ensureErr
+			}
+		} else if l.fipOps != nil {
+			// Floating IPs are no longer desired: delete any that still exist.
+			if err := l.deleteFloatingIPs(ctx, op, svc); err != nil {
+				return nil, err
+			}
+		}
+		if v, ok := annotation.LBHostname.StringFromService(svc); ok {
+			return &corev1.LoadBalancerStatus{
+				Ingress: []corev1.LoadBalancerIngress{{Hostname: v}},
+			}, nil
+		}
+		return &corev1.LoadBalancerStatus{Ingress: buildIngressFromFIPsOnly(fips, svc)}, nil
+	}
+
+	var (
+		reload bool
+		lb     *hcloud.LoadBalancer
+	)
 
 	nodeNames := make([]string, len(selectedNodes))
 	for i, n := range selectedNodes {
@@ -194,6 +282,21 @@ func (l *loadBalancers) EnsureLoadBalancer(
 		}
 	}
 
+	// Floating IP: get or create per requested type, reconcile all to same node, then include in status.
+	var fips []*hcloud.FloatingIP
+	if hcops.FloatingIPEnabled(svc) {
+		var ensureErr error
+		fips, ensureErr = l.ensureFloatingIPs(ctx, op, svc, selectedNodes)
+		if ensureErr != nil {
+			return nil, ensureErr
+		}
+	} else if l.fipOps != nil {
+		// Floating IPs are no longer desired: delete any that still exist.
+		if err := l.deleteFloatingIPs(ctx, op, svc); err != nil {
+			return nil, err
+		}
+	}
+
 	// Either set the Hostname or the IPs (below).
 	// See: https://github.com/kubernetes/kubernetes/issues/66607
 	if v, ok := annotation.LBHostname.StringFromService(svc); ok {
@@ -202,7 +305,7 @@ func (l *loadBalancers) EnsureLoadBalancer(
 		}, nil
 	}
 
-	ingress, err := l.buildLoadBalancerStatusIngress(lb, svc)
+	ingress, err := l.buildLoadBalancerStatusIngress(lb, svc, fips)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
@@ -210,7 +313,7 @@ func (l *loadBalancers) EnsureLoadBalancer(
 	return &corev1.LoadBalancerStatus{Ingress: ingress}, nil
 }
 
-func (l *loadBalancers) buildLoadBalancerStatusIngress(lb *hcloud.LoadBalancer, svc *corev1.Service) ([]corev1.LoadBalancerIngress, error) {
+func (l *loadBalancers) buildLoadBalancerStatusIngress(lb *hcloud.LoadBalancer, svc *corev1.Service, fips []*hcloud.FloatingIP) ([]corev1.LoadBalancerIngress, error) {
 	const op = "hcloud/loadBalancers.getLoadBalancerStatusIngress"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
 
@@ -253,6 +356,15 @@ func (l *loadBalancers) buildLoadBalancerStatusIngress(lb *hcloud.LoadBalancer, 
 		for _, privateNet := range lb.PrivateNet {
 			ingress = append(ingress, corev1.LoadBalancerIngress{
 				IP:     privateNet.IP.String(),
+				IPMode: &ipMode,
+			})
+		}
+	}
+
+	for _, fip := range fips {
+		if fip != nil && fip.IP != nil {
+			ingress = append(ingress, corev1.LoadBalancerIngress{
+				IP:     fip.IP.String(),
 				IPMode: &ipMode,
 			})
 		}
@@ -303,15 +415,21 @@ func (l *loadBalancers) UpdateLoadBalancer(
 	const op = "hcloud/loadBalancers.UpdateLoadBalancer"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
 
-	var (
-		lb            *hcloud.LoadBalancer
-		err           error
-		selectedNodes []*corev1.Node
-	)
-
-	selectedNodes, err = matchNodeSelector(svc, nodes)
+	selectedNodes, err := matchNodeSelector(svc, nodes)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
+	}
+
+	if !loadBalancerEnabled(svc) {
+		// No HCloud LB; delete any existing one we created, then only update FIP assignment.
+		if err := l.deleteExistingLoadBalancerIfPresent(ctx, op, clusterName, svc); err != nil {
+			return err
+		}
+		if hcops.FloatingIPEnabled(svc) {
+			return l.updateFloatingIPAssignment(ctx, op, svc, selectedNodes)
+		}
+		// Floating IPs are no longer desired: delete any that still exist.
+		return l.deleteFloatingIPs(ctx, op, svc)
 	}
 
 	nodeNames := make([]string, len(selectedNodes))
@@ -320,7 +438,7 @@ func (l *loadBalancers) UpdateLoadBalancer(
 	}
 	klog.InfoS("update Load Balancer", "op", op, "service", svc.Name, "nodes", nodeNames)
 
-	lb, err = l.lbOps.GetByK8SServiceUID(ctx, svc)
+	lb, err := l.lbOps.GetByK8SServiceUID(ctx, svc)
 	if errors.Is(err, hcops.ErrNotFound) {
 		lbName := l.GetLoadBalancerName(ctx, clusterName, svc)
 
@@ -343,12 +461,29 @@ func (l *loadBalancers) UpdateLoadBalancer(
 	if _, err = l.lbOps.ReconcileHCLBServices(ctx, lb, svc); err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
+
+	if l.fipOps != nil {
+		if hcops.FloatingIPEnabled(svc) {
+			if err := l.updateFloatingIPAssignment(ctx, op, svc, selectedNodes); err != nil {
+				return err
+			}
+		} else {
+			// Floating IPs are no longer desired: delete any that still exist.
+			if err := l.deleteFloatingIPs(ctx, op, svc); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
 func (l *loadBalancers) EnsureLoadBalancerDeleted(ctx context.Context, _ string, service *corev1.Service) error {
 	const op = "hcloud/loadBalancers.EnsureLoadBalancerDeleted"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
+
+	if err := l.deleteFloatingIPs(ctx, op, service); err != nil {
+		return err
+	}
 
 	loadBalancer, err := l.lbOps.GetByK8SServiceUID(ctx, service)
 	if errors.Is(err, hcops.ErrNotFound) {

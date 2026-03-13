@@ -84,7 +84,7 @@ func (tt *LoadBalancerTestCase) run(t *testing.T) {
 		IPv6Enabled:           *tt.UseIPv6Default,
 	}
 
-	tt.LoadBalancers = newLoadBalancers(tt.LBOps, lbConfig)
+	tt.LoadBalancers = newLoadBalancers(tt.LBOps, lbConfig, nil)
 	tt.Perform(t, tt)
 
 	tt.LBOps.AssertExpectations(t)

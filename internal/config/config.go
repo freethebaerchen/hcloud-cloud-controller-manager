@@ -75,6 +75,7 @@ type LoadBalancerConfiguration struct {
 	AlgorithmType         hcloud.LoadBalancerAlgorithmType
 	DisablePublicNetwork  *bool
 	Enabled               bool
+	FloatingIPLocation    string
 	HealthCheckInterval   time.Duration
 	HealthCheckRetries    int
 	HealthCheckTimeout    time.Duration
@@ -234,6 +235,7 @@ func Read() (HCCMConfiguration, error) {
 	}
 
 	cfg.LoadBalancer.Type = os.Getenv(hcloudLoadBalancersType)
+	cfg.LoadBalancer.FloatingIPLocation = os.Getenv(hcloudFloatingIPLocation)
 
 	cfg.Network.NameOrID = os.Getenv(hcloudNetwork)
 	disableAttachedCheck, err := getEnvBool(hcloudNetworkDisableAttachedCheck, false)

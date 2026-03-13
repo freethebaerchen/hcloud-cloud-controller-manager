@@ -1,6 +1,16 @@
 package annotation
 
 const (
+	// LBEnabled enables creation and management of a Hetzner Cloud Load
+	// Balancer for this service. When set to "false", the CCM will not create
+	// or update an HCloud Load Balancer; Floating IP handling is still
+	// performed if configured. Useful for LoadBalancer services that use only
+	// Floating IPs.
+	//
+	// Type: bool (annotation value must be string, e.g. "true" or "false")
+	// Default: true
+	LBEnabled Name = "load-balancer.hetzner.cloud/enabled"
+
 	// LBPublicIPv4 is the public IPv4 address assigned to the Load Balancer by
 	// the backend.
 	//

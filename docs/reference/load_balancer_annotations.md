@@ -7,6 +7,7 @@ This page contains all annotations, which can be specified at a Service of type 
 
 | Name | Type | Default | Read-only | Description |
 | --- | --- | --- | --- | --- |
+| `load-balancer.hetzner.cloud/enabled` | `string` | `true` | `No` | When set to `"false"`, the CCM does not create or manage a Hetzner Cloud Load Balancer for this service. Any existing HCloud Load Balancer owned by this service is deleted on the next reconciliation. Floating IP handling is still performed if configured. Use this for LoadBalancer services that use only Floating IPs. |
 | `load-balancer.hetzner.cloud/ipv4` | `string` | `-` | `Yes` | Is the public IPv4 address assigned to the Load Balancer by the backend. |
 | `load-balancer.hetzner.cloud/ipv4-rdns` | `string` | `-` | `Yes` | Is the reverse DNS record assigned to the IPv4 address of the Load Balancer. |
 | `load-balancer.hetzner.cloud/ipv6` | `string` | `-` | `Yes` | Is the public IPv6 address assigned to the Load Balancer by the backend. |
