@@ -46,6 +46,18 @@ func Test_getIPv6AddressForIngress(t *testing.T) {
 		base := net.ParseIP("2a01:4f8:1c17:b0b0::")
 		assert.Equal(t, "2a01:4f8:1c17:b0b0::1", getIPv6AddressForIngress(svc, base))
 	})
+
+	t.Run("network address defaults to ::1", func(t *testing.T) {
+		svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}
+		base := net.ParseIP("2a01:4f8:1c17:a025::")
+		assert.Equal(t, "2a01:4f8:1c17:a025::1", getIPv6AddressForIngress(svc, base))
+	})
+
+	t.Run("non-network address used as-is", func(t *testing.T) {
+		svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}
+		base := net.ParseIP("2a01:4f8:1c17:a025::2")
+		assert.Equal(t, "2a01:4f8:1c17:a025::2", getIPv6AddressForIngress(svc, base))
+	})
 }
 
 func Test_buildIngressFromFIPsOnly(t *testing.T) {

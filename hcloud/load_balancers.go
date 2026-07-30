@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -363,8 +364,12 @@ func (l *loadBalancers) buildLoadBalancerStatusIngress(lb *hcloud.LoadBalancer, 
 
 	for _, fip := range fips {
 		if fip != nil && fip.IP != nil {
+			ipStr := fip.IP.String()
+			if fip.IP.To4() == nil && strings.HasSuffix(ipStr, "::") {
+				ipStr += "1"
+			}
 			ingress = append(ingress, corev1.LoadBalancerIngress{
-				IP:     fip.IP.String(),
+				IP:     ipStr,
 				IPMode: &ipMode,
 			})
 		}

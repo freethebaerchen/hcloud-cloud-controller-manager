@@ -127,7 +127,11 @@ func getIPv6AddressForIngress(svc *corev1.Service, base net.IP) string {
 	v, ok := annotation.FIPIPv6Address.StringFromService(svc)
 	if !ok || v == "" {
 		if base != nil && base.To4() == nil {
-			return base.String()
+			baseStr := base.String()
+			if strings.HasSuffix(baseStr, "::") {
+				return baseStr + "1"
+			}
+			return baseStr
 		}
 		return defaultIPv6
 	}
