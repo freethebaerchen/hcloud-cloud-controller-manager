@@ -13,6 +13,7 @@ import (
 
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/annotation"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/hcops"
+	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/mocks"
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 )
 
@@ -196,7 +197,8 @@ func TestReconcileAssignment_UsesNetworkZone(t *testing.T) {
 
 	mockFIP := new(mockFloatingIPClient)
 	mockServer := new(mockServerClient)
-	mockAction := new(mockActionClient)
+	mockAction := &mocks.ActionClient{}
+	mockAction.Test(t)
 
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
@@ -214,11 +216,9 @@ func TestReconcileAssignment_UsesNetworkZone(t *testing.T) {
 
 	server := &hcloud.Server{
 		ID: 123,
-		Datacenter: &hcloud.Datacenter{
-			Location: &hcloud.Location{
-				Name:        "fsn1",
-				NetworkZone: "eu-central",
-			},
+		Location: &hcloud.Location{
+			Name:        "fsn1",
+			NetworkZone: "eu-central",
 		},
 	}
 
@@ -299,15 +299,6 @@ func (m *mockServerClient) GetByID(ctx context.Context, id int64) (*hcloud.Serve
 		return nil, args.Get(1).(*hcloud.Response), args.Error(2)
 	}
 	return args.Get(0).(*hcloud.Server), args.Get(1).(*hcloud.Response), args.Error(2)
-}
-
-type mockActionClient struct {
-	mock.Mock
-}
-
-func (m *mockActionClient) WaitFor(ctx context.Context, actions ...*hcloud.Action) error {
-	args := m.Called(ctx, actions)
-	return args.Error(0)
 }
 
 func TestFloatingIPOps_GetByK8SServiceUIDAndType(t *testing.T) {

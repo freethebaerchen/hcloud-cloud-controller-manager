@@ -37,10 +37,10 @@ type HCloudServerClient interface {
 }
 
 type FloatingIPOps struct {
-	FIPClient     HCloudFloatingIPClient
-	ActionClient  HCloudActionClient
-	ServerClient  HCloudServerClient
-	Recorder      record.EventRecorder
+	FIPClient    HCloudFloatingIPClient
+	ActionClient hcloud.IActionClient
+	ServerClient HCloudServerClient
+	Recorder     record.EventRecorder
 }
 
 func fipTypeLabel(typ hcloud.FloatingIPType) string {
@@ -159,7 +159,7 @@ func (f *FloatingIPOps) ReconcileAssignment(
 		if server == nil {
 			continue
 		}
-		if server.Datacenter == nil || server.Datacenter.Location.NetworkZone != homeZone {
+		if server.Location == nil || server.Location.NetworkZone != homeZone {
 			continue
 		}
 		if !isNodeReady(node) {
