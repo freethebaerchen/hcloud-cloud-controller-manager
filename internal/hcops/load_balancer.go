@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"sync"
 	"time"
 
+	hrobot "github.com/syself/hrobot-go"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
@@ -16,7 +18,6 @@ import (
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/config"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/metrics"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/providerid"
-	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/robot"
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 )
 
@@ -24,57 +25,12 @@ import (
 // identify a load balancer managed by Hetzner Cloud Cloud Controller Manager.
 const LabelServiceUID = "hcloud-ccm/service-uid"
 
-// HCloudLoadBalancerClient defines the hcloud-go functions required by the
-// Load Balancer operations type.
-type HCloudLoadBalancerClient interface {
-	GetByID(ctx context.Context, id int64) (*hcloud.LoadBalancer, *hcloud.Response, error)
-	GetByName(ctx context.Context, name string) (*hcloud.LoadBalancer, *hcloud.Response, error)
-
-	Create(ctx context.Context, opts hcloud.LoadBalancerCreateOpts) (hcloud.LoadBalancerCreateResult, *hcloud.Response, error)
-	Update(
-		ctx context.Context, lb *hcloud.LoadBalancer, opts hcloud.LoadBalancerUpdateOpts,
-	) (*hcloud.LoadBalancer, *hcloud.Response, error)
-	Delete(ctx context.Context, lb *hcloud.LoadBalancer) (*hcloud.Response, error)
-
-	AddService(
-		ctx context.Context, lb *hcloud.LoadBalancer, opts hcloud.LoadBalancerAddServiceOpts,
-	) (*hcloud.Action, *hcloud.Response, error)
-	UpdateService(
-		ctx context.Context, lb *hcloud.LoadBalancer, listenPort int, opts hcloud.LoadBalancerUpdateServiceOpts,
-	) (*hcloud.Action, *hcloud.Response, error)
-	DeleteService(
-		ctx context.Context, lb *hcloud.LoadBalancer, listenPort int,
-	) (*hcloud.Action, *hcloud.Response, error)
-
-	ChangeAlgorithm(ctx context.Context, lb *hcloud.LoadBalancer, opts hcloud.LoadBalancerChangeAlgorithmOpts) (*hcloud.Action, *hcloud.Response, error)
-	ChangeType(ctx context.Context, lb *hcloud.LoadBalancer, opts hcloud.LoadBalancerChangeTypeOpts) (*hcloud.Action, *hcloud.Response, error)
-	ChangeDNSPtr(ctx context.Context, lb *hcloud.LoadBalancer, ip string, ptr *string) (*hcloud.Action, *hcloud.Response, error)
-
-	AddServerTarget(ctx context.Context, lb *hcloud.LoadBalancer, opts hcloud.LoadBalancerAddServerTargetOpts) (*hcloud.Action, *hcloud.Response, error)
-	RemoveServerTarget(ctx context.Context, lb *hcloud.LoadBalancer, server *hcloud.Server) (*hcloud.Action, *hcloud.Response, error)
-
-	AddIPTarget(ctx context.Context, lb *hcloud.LoadBalancer, opts hcloud.LoadBalancerAddIPTargetOpts) (*hcloud.Action, *hcloud.Response, error)
-	RemoveIPTarget(ctx context.Context, lb *hcloud.LoadBalancer, server net.IP) (*hcloud.Action, *hcloud.Response, error)
-
-	AttachToNetwork(ctx context.Context, lb *hcloud.LoadBalancer, opts hcloud.LoadBalancerAttachToNetworkOpts) (*hcloud.Action, *hcloud.Response, error)
-	DetachFromNetwork(ctx context.Context, lb *hcloud.LoadBalancer, opts hcloud.LoadBalancerDetachFromNetworkOpts) (*hcloud.Action, *hcloud.Response, error)
-
-	EnablePublicInterface(
-		ctx context.Context, loadBalancer *hcloud.LoadBalancer,
-	) (*hcloud.Action, *hcloud.Response, error)
-	DisablePublicInterface(
-		ctx context.Context, loadBalancer *hcloud.LoadBalancer,
-	) (*hcloud.Action, *hcloud.Response, error)
-
-	AllWithOpts(ctx context.Context, opts hcloud.LoadBalancerListOpts) ([]*hcloud.LoadBalancer, error)
-}
-
 // LoadBalancerOps implements all operations regarding Hetzner Cloud Load Balancers.
 type LoadBalancerOps struct {
-	LBClient      HCloudLoadBalancerClient
-	ActionClient  HCloudActionClient
-	NetworkClient HCloudNetworkClient
-	RobotClient   robot.Client
+	LBClient      hcloud.ILoadBalancerClient
+	ActionClient  hcloud.IActionClient
+	NetworkClient hcloud.INetworkClient
+	RobotClient   hrobot.RobotClient
 	CertOps       *CertificateOps
 	RetryDelay    time.Duration
 	NetworkID     int64
@@ -212,10 +168,10 @@ func (l *LoadBalancerOps) Create(
 	disablePubIface, err := annotation.LBDisablePublicNetwork.BoolFromService(svc)
 	switch {
 	case err == nil:
-		opts.PublicInterface = hcloud.Ptr(!disablePubIface)
+		opts.PublicInterface = new(!disablePubIface)
 	case errors.Is(err, annotation.ErrNotSet):
 		if l.Cfg.LoadBalancer.DisablePublicNetwork != nil {
-			opts.PublicInterface = hcloud.Ptr(!*l.Cfg.LoadBalancer.DisablePublicNetwork)
+			opts.PublicInterface = new(!*l.Cfg.LoadBalancer.DisablePublicNetwork)
 		}
 	default:
 		return nil, fmt.Errorf("%s: %w", op, err)
@@ -330,9 +286,7 @@ func (l *LoadBalancerOps) changeHCLBInfo(ctx context.Context, lb *hcloud.LoadBal
 		// updating is really successful.
 		labels := make(map[string]string, len(lb.Labels)+1)
 		labels[LabelServiceUID] = string(svc.ObjectMeta.UID)
-		for k, v := range lb.Labels {
-			labels[k] = v
-		}
+		maps.Copy(labels, lb.Labels)
 		opts.Labels = labels
 		update = true
 	}
@@ -581,7 +535,7 @@ func (l *LoadBalancerOps) togglePublicInterface(ctx context.Context, lb *hcloud.
 	var desiredDisable *bool
 	switch {
 	case err == nil:
-		desiredDisable = hcloud.Ptr(disable)
+		desiredDisable = new(disable)
 	case errors.Is(err, annotation.ErrNotSet):
 		desiredDisable = l.Cfg.LoadBalancer.DisablePublicNetwork
 	default:
@@ -680,44 +634,76 @@ func (l *LoadBalancerOps) ReconcileHCLBTargets(
 	// List all robot servers to check whether the ip targets of the load balancer
 	// correspond to a dedicated server
 
-	if l.Cfg.Robot.Enabled {
+	useRobotAPI := l.Cfg.Robot.Enabled && l.RobotClient != nil
+	useRobotInternalIPs := l.Cfg.Robot.Enabled && l.RobotClient == nil && privateIPEnabled
+
+	// Use Robot API to either fetch ExternalIP or use InternalIP from Node objects
+	if useRobotAPI {
 		dedicatedServers, err := l.RobotClient.ServerGetList()
 		if err != nil {
 			return changed, fmt.Errorf("%s: failed to get list of dedicated servers: %w", op, err)
 		}
 
 		for _, s := range dedicatedServers {
-			if privateIPEnabled {
-				node, ok := k8sNodes[int64(s.ServerNumber)]
-				if !ok {
-					continue
-				}
+			// Set ExternalIP as Load Balancer target
+			robotIPsToIDs[s.ServerIP] = s.ServerNumber
+			robotIDToIPv4[s.ServerNumber] = s.ServerIP
 
-				internalIP := getNodeInternalIP(node)
-				if internalIP != "" {
-					robotIPsToIDs[internalIP] = s.ServerNumber
-					robotIDToIPv4[s.ServerNumber] = internalIP
-					continue
-				}
+			// If user does not want private IPs we can skip this part
+			if !privateIPEnabled {
+				continue
+			}
 
-				klog.Warningf(
+			node, ok := k8sNodes[int64(s.ServerNumber)]
+			if !ok {
+				continue
+			}
+
+			// Check if InternalIP is set at Node object
+			internalIP := getNodeInternalIP(node)
+			if internalIP == "" {
+				warnMsg := fmt.Sprintf(
 					"%s: load balancer %s has set `use-private-ip: true`, but no InternalIP found for node %s. Continuing with ExternalIP.",
 					op,
 					svc.Name,
 					node.Name,
 				)
-				l.Recorder.Eventf(
-					svc,
-					corev1.EventTypeWarning,
-					"InternalIPNotConfigured",
-					"%s: load balancer has set `use-private-ip: true`, but no InternalIP found for node %s. Continuing with ExternalIP.",
-					op,
-					node.Name,
-				)
+				klog.Warning(warnMsg)
+				l.Recorder.Eventf(svc, corev1.EventTypeWarning, "InternalIPNotConfigured", "%s", warnMsg)
+				continue
 			}
 
-			robotIPsToIDs[s.ServerIP] = s.ServerNumber
-			robotIDToIPv4[s.ServerNumber] = s.ServerIP
+			// Overwrite ExternalIP with InternalIP
+			robotIPsToIDs[internalIP] = s.ServerNumber
+			robotIDToIPv4[s.ServerNumber] = internalIP
+		}
+	}
+
+	// Use InternalIPs for Robot servers without querying the API
+	if useRobotInternalIPs {
+		// No Robot client: derive IP mapping directly from Kubernetes Node
+		// objects. This works when the node's InternalIP is the correct
+		// target (e.g. vSwitch private IP).
+		for id := range k8sNodeIDsRobot {
+			node, ok := k8sNodes[int64(id)]
+			if !ok {
+				continue
+			}
+
+			internalIP := getNodeInternalIP(node)
+			if internalIP == "" {
+				warnMsg := fmt.Sprintf(
+					"no InternalIP found for Robot node %s (id=%d), cannot add as LB target without Robot credentials; skipping",
+					node.Name,
+					id,
+				)
+				klog.Warning(warnMsg)
+				l.Recorder.Eventf(svc, corev1.EventTypeWarning, "InternalIPNotConfigured", "%s", warnMsg)
+				continue
+			}
+
+			robotIPsToIDs[internalIP] = id
+			robotIDToIPv4[id] = internalIP
 		}
 	}
 
@@ -1088,7 +1074,7 @@ func (b *hclbServiceOptsBuilder) extract() {
 	b.do(func() error {
 		pp, err := annotation.LBSvcProxyProtocol.BoolFromService(b.Service)
 		if err == nil {
-			b.proxyProtocol = hcloud.Ptr(pp)
+			b.proxyProtocol = new(pp)
 			return nil
 		}
 		if errors.Is(err, annotation.ErrNotSet) {
@@ -1255,7 +1241,7 @@ func (b *hclbServiceOptsBuilder) extractHealthCheck() {
 		if err != nil {
 			return fmt.Errorf("%s: %w", op, err)
 		}
-		b.healthCheckOpts.Port = hcloud.Ptr(hcPort)
+		b.healthCheckOpts.Port = new(hcPort)
 		b.addHealthCheck = true
 		return nil
 	})
@@ -1369,8 +1355,8 @@ func (b *hclbServiceOptsBuilder) buildAddServiceOpts() (hcloud.LoadBalancerAddSe
 	}
 
 	opts := hcloud.LoadBalancerAddServiceOpts{
-		ListenPort:      hcloud.Ptr(b.listenPort),
-		DestinationPort: hcloud.Ptr(b.destinationPort),
+		ListenPort:      new(b.listenPort),
+		DestinationPort: new(b.destinationPort),
 		Protocol:        b.protocol,
 		Proxyprotocol:   b.proxyProtocol,
 	}
@@ -1386,7 +1372,7 @@ func (b *hclbServiceOptsBuilder) buildAddServiceOpts() (hcloud.LoadBalancerAddSe
 	if b.addHealthCheck {
 		port := b.healthCheckOpts.Port
 		if port == nil {
-			port = hcloud.Ptr(b.destinationPort)
+			port = new(b.destinationPort)
 		}
 		opts.HealthCheck = &hcloud.LoadBalancerAddServiceOptsHealthCheck{
 			Protocol: b.healthCheckOpts.Protocol,
@@ -1408,7 +1394,7 @@ func (b *hclbServiceOptsBuilder) buildAddServiceOpts() (hcloud.LoadBalancerAddSe
 	} else {
 		opts.HealthCheck = &hcloud.LoadBalancerAddServiceOptsHealthCheck{
 			Protocol: hcloud.LoadBalancerServiceProtocolTCP,
-			Port:     hcloud.Ptr(b.destinationPort),
+			Port:     new(b.destinationPort),
 		}
 	}
 
@@ -1424,7 +1410,7 @@ func (b *hclbServiceOptsBuilder) buildUpdateServiceOpts() (hcloud.LoadBalancerUp
 	}
 
 	opts := hcloud.LoadBalancerUpdateServiceOpts{
-		DestinationPort: hcloud.Ptr(b.destinationPort),
+		DestinationPort: new(b.destinationPort),
 		Protocol:        b.protocol,
 		Proxyprotocol:   b.proxyProtocol,
 	}
@@ -1440,7 +1426,7 @@ func (b *hclbServiceOptsBuilder) buildUpdateServiceOpts() (hcloud.LoadBalancerUp
 	if b.addHealthCheck {
 		port := b.healthCheckOpts.Port
 		if port == nil {
-			port = hcloud.Ptr(b.destinationPort)
+			port = new(b.destinationPort)
 		}
 		opts.HealthCheck = &hcloud.LoadBalancerUpdateServiceOptsHealthCheck{
 			Protocol: b.healthCheckOpts.Protocol,
@@ -1462,7 +1448,7 @@ func (b *hclbServiceOptsBuilder) buildUpdateServiceOpts() (hcloud.LoadBalancerUp
 	} else {
 		opts.HealthCheck = &hcloud.LoadBalancerUpdateServiceOptsHealthCheck{
 			Protocol: hcloud.LoadBalancerServiceProtocolTCP,
-			Port:     hcloud.Ptr(b.destinationPort),
+			Port:     new(b.destinationPort),
 		}
 	}
 

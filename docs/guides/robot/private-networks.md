@@ -8,6 +8,8 @@ As a result, the annotation `load-balancer.hetzner.cloud/use-private-ip` can be 
 
 Enable Robot support as outlined in the [Robot setup guide](./quickstart.md). As mentioned there, for a Robot server we pass along configured InternalIPs, that do not appear as an ExternalIP and are within the configured address family. Check with `kubectl get nodes -o json | jq ".items.[].status.addresses"` if you have configured an InternalIP.
 
+> If you don't need Robot API credentials for this setup, see the [LB-only without credentials guide](./lb-only-without-credentials.md).
+
 ## Configuration
 
 Since the HCCM needs to fetch network data, provide the network ID using the `HCLOUD_NETWORK` environment variable. To disable the Routes controller, which is incompatible with vSwitches, disable networking in the Helm chart and set `HCLOUD_NETWORK_ROUTES_ENABLED=false`. Use the following snippet as a reference.

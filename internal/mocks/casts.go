@@ -39,12 +39,28 @@ func getLoadBalancerPtrS(args mock.Arguments, i int) []*hcloud.LoadBalancer {
 	return v.([]*hcloud.LoadBalancer)
 }
 
+func getRobotServer(args mock.Arguments, i int) *hrobotmodels.Server {
+	v := args.Get(i)
+	if v == nil {
+		return nil
+	}
+	return v.(*hrobotmodels.Server)
+}
+
 func getRobotServers(args mock.Arguments, i int) []hrobotmodels.Server {
 	v := args.Get(i)
 	if v == nil {
 		return nil
 	}
 	return v.([]hrobotmodels.Server)
+}
+
+func getReset(args mock.Arguments, i int) *hrobotmodels.Reset {
+	v := args.Get(i)
+	if v == nil {
+		return nil
+	}
+	return v.(*hrobotmodels.Reset)
 }
 
 func getNetworkPtr(args mock.Arguments, i int) *hcloud.Network {

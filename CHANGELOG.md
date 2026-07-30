@@ -1,5 +1,96 @@
 # Changelog
 
+## [v1.34.0](https://github.com/hetznercloud/hcloud-cloud-controller-manager/releases/tag/v1.34.0)
+
+[Compare to previous version](https://github.com/hetznercloud/hcloud-cloud-controller-manager/compare/v1.33.0...v1.34.0)
+
+### Features
+
+- **chart**: expose podSecurityContext and securityContext values (#1258) ([ebd8cd4](https://github.com/hetznercloud/hcloud-cloud-controller-manager/commit/ebd8cd42b6bc5af0acc0c86035ae8cf1e66e604a))
+
+### Bug Fixes
+
+- **routes**: reject IPv6 routes early (#1280) ([0cba535](https://github.com/hetznercloud/hcloud-cloud-controller-manager/commit/0cba53560b14ec8d1db986c8083232a142c0f104))
+- drop warning for untagged clouds (#1281) ([574262f](https://github.com/hetznercloud/hcloud-cloud-controller-manager/commit/574262f1e7b47b60b3ebfebfa0ab928abc8891db))
+
+## [v1.33.0](https://github.com/hetznercloud/hcloud-cloud-controller-manager/releases/tag/v1.33.0)
+
+### Changed
+
+Renamed `HCLOUD_SERVER_CACHE_TTL` to `HCLOUD_SERVER_CACHE_MAX_AGE`. The server cache lifetime is now configured via `HCLOUD_SERVER_CACHE_MAX_AGE` (default 10s). Individual controllers may override this default for specific lookups — for example, the routes controller uses a longer max age. Action required: if you set `HCLOUD_SERVER_CACHE_TTL`, switch to `HCLOUD_SERVER_CACHE_MAX_AGE`; the old variable is no longer recognized.
+
+### Removed
+
+Removed the `hcops/AllServersCache.*` operation metrics. The legacy AllServersCache was replaced by the shared server cache, so the following `cloud_controller_manager_operations_total` series labeled op="hcops/AllServersCache.*" are no longer emitted:
+- `hcops/AllServersCache.ByID`
+- `hcops/AllServersCache.ByName`
+- `hcops/AllServersCache.ByPrivateIP`
+- `hcops/AllServersCache.getCache`
+- `hcops/AllServersCache.refreshCache`
+
+They are superseded by the new server cache metric `cloud_controller_manager_server_cache_requests_total`, a counter partitioned by subsystem, mode, and result:
+
+- subsystem: instances_v2, routes (or none when unset)
+- mode: all, one, off
+- result: hit, miss
+
+```
+cloud_controller_manager_server_cache_requests_total{subsystem="instances_v2", mode="all", result="hit"}
+cloud_controller_manager_server_cache_requests_total{subsystem="routes",       mode="all", result="miss"}
+```
+
+Update any dashboards or alerts referencing the old op series accordingly.
+
+### Features
+
+- **cache**: replace TTL with max-age
+- **cache**: use server cache in routes controller
+
+### Bug Fixes
+
+- **cache**: when api returns not found do not return an expired entry (#1271)
+
+## [v1.32.0](https://github.com/hetznercloud/hcloud-cloud-controller-manager/releases/tag/v1.32.0)
+
+### Cache Server Lookups in Node Controllers
+
+This release introduces an experimental server cache to reduce Hetzner Cloud API calls. During an experimental phase, breaking changes on those features may occur within minor releases.
+
+The node and node lifecycle controllers look up Servers by ID or name, generating significant API traffic during cluster scaling. A new cache sits between the controllers and the API to serve these lookups, reducing the number of requests.
+
+It is enabled by default since we believe the implementation is safe in practice, but is experimental and may see breaking changes within minor releases. Configure it via environment variables:
+
+- `HCLOUD_SERVER_CACHE_MODE` (`all` | `one` | `off`, default `all`):
+
+  - `all` — fetch all Servers once and serve lookups from the snapshot until the TTL expires.
+  - `one`  — cache each Server individually with its own expiration.
+  - `off`  — disable caching; every lookup hits the API.
+- `HCLOUD_SERVER_CACHE_TTL` (duration, default `10s`): lifetime of cached entries (e.g. `30s`, `2m`); values above a minute are not recommended.
+
+### Features
+
+- **instances**: cache server lookups to reduce API calls (#1252)
+
+## [v1.31.1](https://github.com/hetznercloud/hcloud-cloud-controller-manager/releases/tag/v1.31.1)
+
+### Bug Fixes
+
+- routes controller on node name drift (#1221)
+
+## [v1.31.0](https://github.com/hetznercloud/hcloud-cloud-controller-manager/releases/tag/v1.31.0)
+
+### Features
+
+- **robot**: allow Robot support without API credentials for IP-based LB targets (#1163)
+- **helm**: allow customizing chart deployment strategy (#1190)
+- support Kubernetes v1.36
+- drop support for Kubernetes v1.32
+
+### Bug Fixes
+
+- **helm**: remove permissions for persistentvolumes (#1203)
+- **route**: error handling on locked networks (#1215)
+
 ## [v1.30.1](https://github.com/hetznercloud/hcloud-cloud-controller-manager/releases/tag/v1.30.1)
 
 ### Datacenter Deprecation

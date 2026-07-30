@@ -17,18 +17,14 @@ limitations under the License.
 package hcloud
 
 import (
-	"context"
 	"fmt"
 	"regexp"
 	"strings"
 
+	hrobot "github.com/syself/hrobot-go"
 	hrobotmodels "github.com/syself/hrobot-go/models"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-
-	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/metrics"
-	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/robot"
-	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 )
 
 type MockEventRecorder struct{}
@@ -39,7 +35,7 @@ func (er *MockEventRecorder) Event(_ runtime.Object, _, _, _ string) {
 func (er *MockEventRecorder) Eventf(
 	_ runtime.Object,
 	_, _, _ string,
-	_ ...interface{},
+	_ ...any,
 ) {
 }
 
@@ -47,34 +43,11 @@ func (er *MockEventRecorder) AnnotatedEventf(
 	_ runtime.Object,
 	_ map[string]string,
 	_, _, _ string,
-	_ ...interface{},
+	_ ...any,
 ) {
 }
 
-func getCloudServerByName(ctx context.Context, c *hcloud.Client, name string) (*hcloud.Server, error) {
-	const op = "hcloud/getCloudServerByName"
-	metrics.OperationCalled.WithLabelValues(op).Inc()
-
-	server, _, err := c.Server.GetByName(ctx, name)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", op, err)
-	}
-
-	return server, nil
-}
-
-func getCloudServerByID(ctx context.Context, c *hcloud.Client, id int64) (*hcloud.Server, error) {
-	const op = "hcloud/getCloudServerByID"
-	metrics.OperationCalled.WithLabelValues(op).Inc()
-
-	server, _, err := c.Server.GetByID(ctx, id)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", op, err)
-	}
-	return server, nil
-}
-
-func getRobotServerByName(c robot.Client, node *corev1.Node) (server *hrobotmodels.Server, err error) {
+func getRobotServerByName(c hrobot.RobotClient, node *corev1.Node) (server *hrobotmodels.Server, err error) {
 	const op = "hcloud/getRobotServerByName"
 
 	if c == nil {
@@ -111,7 +84,9 @@ func getRobotServerByID(i *instances, id int, node *corev1.Node) (*hrobotmodels.
 		return nil, nil
 	}
 
-	// check whether name matches - otherwise this server does not belong to the respective node anymore
+	// CAPH reuses Robot servers for multiple clusters and therefore the Robot ID does not change, but only
+	// the name in the Robot API is updated. As the node no longer exists in the cluster with the old name,
+	// we need to return nil here.
 	if server.Name != node.Name {
 		i.recorder.Eventf(
 			node,
@@ -124,7 +99,6 @@ func getRobotServerByID(i *instances, id int, node *corev1.Node) (*hrobotmodels.
 		return nil, nil
 	}
 
-	// return nil, nil if server could not be found
 	return server, nil
 }
 

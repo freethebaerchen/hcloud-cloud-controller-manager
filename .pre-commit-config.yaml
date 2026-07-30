@@ -62,9 +62,9 @@ repos:
         language: node
         types: [text]
         require_serial: false
-        additional_dependencies: [prettier@3.8.1]
+        additional_dependencies: [prettier@3.9.6]
         files: \.(md|ya?ml)$
-        exclude: ^(CHANGELOG.md|chart/templates/.*|chart/.snapshots/.*|docs/reference/load_balancer_.*\.md|)$
+        exclude: ^(CHANGELOG.md|chart/templates/.*|chart/.snapshots/.*|deploy/.*|docs/reference/load_balancer_.*\.md|)$
 
   - repo: local
     hooks:
@@ -72,7 +72,7 @@ repos:
         name: shfmt
         description: Format shell scripts with shfmt
         language: golang
-        additional_dependencies: [mvdan.cc/sh/v3/cmd/shfmt@v3.13.0]
+        additional_dependencies: [mvdan.cc/sh/v3/cmd/shfmt@v3.13.1]
         entry: shfmt -i 2 -ci -sr -kp -w
         types: [shell]
 
@@ -82,10 +82,10 @@ repos:
       - id: shellcheck
 
   - repo: https://github.com/golangci/golangci-lint
-    rev: v2.11.3
+    rev: v2.12.2
     hooks:
       - id: golangci-lint-full
-        language_version: 1.25.8 # renovate: datasource=golang-version depName=go
+        language_version: 1.26.5 # renovate: datasource=golang-version depName=go
 
   - repo: local
     hooks:
@@ -96,3 +96,11 @@ repos:
         entry: go generate ./...
         pass_filenames: false
         files: (^\.md\.tmpl|\.go$)
+
+  - repo: local
+    hooks:
+      - id: go-fix
+        name: go fix
+        language: golang
+        entry: go fix ./...
+        pass_filenames: false

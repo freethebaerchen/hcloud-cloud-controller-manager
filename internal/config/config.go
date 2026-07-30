@@ -11,6 +11,7 @@ import (
 
 	"k8s.io/klog/v2"
 
+	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/cache"
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 	"github.com/hetznercloud/hcloud-go/v2/hcloud/exp/kit/envutil"
 )
@@ -29,6 +30,8 @@ const (
 	robotForwardInternalIPs = "ROBOT_FORWARD_INTERNAL_IPS"
 
 	hcloudInstancesAddressFamily = "HCLOUD_INSTANCES_ADDRESS_FAMILY"
+	hcloudServerCacheMode        = "HCLOUD_SERVER_CACHE_MODE"
+	hcloudServerCacheMaxAge      = "HCLOUD_SERVER_CACHE_MAX_AGE"
 
 	// Disable the "master/server is attached to the network" check against the metadata service.
 	hcloudNetworkDisableAttachedCheck = "HCLOUD_NETWORK_DISABLE_ATTACHED_CHECK"
@@ -67,8 +70,15 @@ const (
 	AddressFamilyIPv4      AddressFamily = "ipv4"
 )
 
+const ServerCacheDefaultMaxAge time.Duration = 10 * time.Second
+
 type InstanceConfiguration struct {
 	AddressFamily AddressFamily
+}
+
+type ServerCacheConfiguration struct {
+	Mode   cache.Mode
+	MaxAge time.Duration
 }
 
 type LoadBalancerConfiguration struct {
@@ -106,6 +116,7 @@ type HCCMConfiguration struct {
 	LoadBalancer LoadBalancerConfiguration
 	Network      NetworkConfiguration
 	Route        RouteConfiguration
+	ServerCache  ServerCacheConfiguration
 }
 
 // Read evaluates all environment variables and returns a [HCCMConfiguration]. It only validates as far as
@@ -173,6 +184,28 @@ func Read() (HCCMConfiguration, error) {
 	cfg.Instance.AddressFamily = AddressFamily(os.Getenv(hcloudInstancesAddressFamily))
 	if cfg.Instance.AddressFamily == "" {
 		cfg.Instance.AddressFamily = AddressFamilyIPv4
+	}
+
+	// ---- Server Cache ----
+
+	cfg.ServerCache = ServerCacheConfiguration{
+		Mode:   cache.ModeAll,
+		MaxAge: ServerCacheDefaultMaxAge,
+	}
+
+	if mode, ok := os.LookupEnv(hcloudServerCacheMode); ok {
+		klog.Warningf("Experimental: %s is experimental, breaking changes may occur within minor releases.", hcloudServerCacheMode)
+		cfg.ServerCache.Mode = cache.Mode(mode)
+	}
+
+	if maxAgeStr, ok := os.LookupEnv(hcloudServerCacheMaxAge); ok {
+		klog.Warningf("Experimental: %s is experimental, breaking changes may occur within minor releases.", hcloudServerCacheMaxAge)
+		maxAge, err := time.ParseDuration(maxAgeStr)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("invalid value for %q: %w", hcloudServerCacheMaxAge, err))
+		} else {
+			cfg.ServerCache.MaxAge = maxAge
+		}
 	}
 
 	cfg.LoadBalancer.Enabled, err = getEnvBool(hcloudLoadBalancersEnabled, true)
@@ -274,6 +307,10 @@ func (c HCCMConfiguration) Validate() (err error) {
 		errs = append(errs, fmt.Errorf("invalid value for %q, expect one of: %s,%s,%s", hcloudInstancesAddressFamily, AddressFamilyIPv4, AddressFamilyIPv6, AddressFamilyDualStack))
 	}
 
+	if c.ServerCache.Mode != cache.ModeAll && c.ServerCache.Mode != cache.ModeOne && c.ServerCache.Mode != cache.ModeOff {
+		errs = append(errs, fmt.Errorf("invalid value for %q, expect one of: %s,%s,%s", hcloudServerCacheMode, cache.ModeAll, cache.ModeOne, cache.ModeOff))
+	}
+
 	if c.LoadBalancer.Location != "" && c.LoadBalancer.NetworkZone != "" {
 		errs = append(errs, fmt.Errorf("invalid value for %q/%q, only one of them can be set", hcloudLoadBalancersLocation, hcloudLoadBalancersNetworkZone))
 	}
@@ -291,11 +328,15 @@ func (c HCCMConfiguration) Validate() (err error) {
 	}
 
 	if c.Robot.Enabled {
-		if c.Robot.User == "" {
-			errs = append(errs, fmt.Errorf("environment variable %q is required if Robot support is enabled", robotUser))
+		// Robot credentials are optional. When only using the service
+		// controller with IP-based LB targets, the node's InternalIP from
+		// Kubernetes is sufficient and no Robot API access is needed.
+		if (c.Robot.User == "") != (c.Robot.Password == "") {
+			// Partial credentials are likely a misconfiguration.
+			errs = append(errs, fmt.Errorf("both %q and %q must be provided, or neither", robotUser, robotPassword))
 		}
-		if c.Robot.Password == "" {
-			errs = append(errs, fmt.Errorf("environment variable %q is required if Robot support is enabled", robotPassword))
+		if c.Robot.User == "" && c.Robot.Password == "" {
+			klog.Infof("Robot support enabled without credentials. Some features might not work as expected.")
 		}
 
 		if c.Route.Enabled {

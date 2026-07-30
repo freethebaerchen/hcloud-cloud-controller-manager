@@ -28,10 +28,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/record"
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/klog/v2"
 
+	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/cache"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/config"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/hcops"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/metrics"
@@ -50,16 +52,19 @@ var providerVersion = "unknown"
 
 type cloud struct {
 	client      *hcloud.Client
-	robotClient robot.Client
+	robotClient hrobot.RobotClient
+	serverCache *cache.Cache[hcloud.Server]
 	cfg         config.HCCMConfiguration
 	recorder    record.EventRecorder
 	networkID   int64
 	cidr        string
+	nodeLister  corelisters.NodeLister
 }
 
-func NewCloud(cidr string) (cloudprovider.Interface, error) {
+func NewCloud(cidr string, nodeLister corelisters.NodeLister) (cloudprovider.Interface, error) {
 	const op = "hcloud/newCloud"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
+	ctx := context.Background()
 
 	cfg, err := config.Read()
 	if err != nil {
@@ -93,10 +98,13 @@ func NewCloud(cidr string) (cloudprovider.Interface, error) {
 		opts = append(opts, hcloud.WithEndpoint(cfg.HCloudClient.Endpoint))
 	}
 	client := hcloud.NewClient(opts...)
-	metadataClient := metadata.NewClient()
 
-	var robotClient robot.Client
-	if cfg.Robot.Enabled {
+	metadataClient := metadata.NewClient(
+		metadata.WithApplication("hcloud-cloud-controller", providerVersion),
+	)
+
+	var robotClient hrobot.RobotClient
+	if cfg.Robot.Enabled && cfg.Robot.User != "" && cfg.Robot.Password != "" {
 		c := hrobot.NewBasicAuthClientWithCustomHttpClient(
 			cfg.Robot.User,
 			cfg.Robot.Password,
@@ -113,7 +121,7 @@ func NewCloud(cidr string) (cloudprovider.Interface, error) {
 
 	var networkID int64
 	if cfg.Network.NameOrID != "" {
-		n, _, err := client.Network.Get(context.Background(), cfg.Network.NameOrID)
+		n, _, err := client.Network.Get(ctx, cfg.Network.NameOrID)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", op, err)
 		}
@@ -123,7 +131,7 @@ func NewCloud(cidr string) (cloudprovider.Interface, error) {
 		networkID = n.ID
 
 		if cfg.Network.AttachedCheckEnabled {
-			attached, err := serverIsAttachedToNetwork(metadataClient, networkID)
+			attached, err := serverIsAttachedToNetwork(ctx, metadataClient, networkID)
 			if err != nil {
 				return nil, fmt.Errorf("%s: checking if server is in Network not possible: %w", op, err)
 			}
@@ -134,19 +142,23 @@ func NewCloud(cidr string) (cloudprovider.Interface, error) {
 	}
 
 	// Validate that the provided token works, and we have network connectivity to the Hetzner Cloud API
-	_, _, err = client.Location.List(context.Background(), hcloud.LocationListOpts{})
+	_, _, err = client.Location.List(ctx, hcloud.LocationListOpts{})
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 
 	klog.Infof("Hetzner Cloud k8s cloud controller %s started\n", providerVersion)
 
+	serverCache := cache.NewServerCache(client, cfg.ServerCache.Mode, cfg.ServerCache.MaxAge)
+
 	return &cloud{
 		client:      client,
 		robotClient: robotClient,
+		serverCache: serverCache,
 		cfg:         cfg,
 		networkID:   networkID,
 		cidr:        cidr,
+		nodeLister:  nodeLister,
 	}, nil
 }
 
@@ -171,7 +183,7 @@ func (c *cloud) Instances() (cloudprovider.Instances, bool) {
 }
 
 func (c *cloud) InstancesV2() (cloudprovider.InstancesV2, bool) {
-	return newInstances(c.client, c.robotClient, c.recorder, c.networkID, c.cfg), true
+	return newInstances(c.client, c.robotClient, c.serverCache, c.recorder, c.networkID, c.cfg), true
 }
 
 func (c *cloud) Zones() (cloudprovider.Zones, bool) {
@@ -220,6 +232,8 @@ func (c *cloud) Routes() (cloudprovider.Routes, bool) {
 		c.networkID,
 		c.cidr,
 		c.recorder,
+		c.nodeLister,
+		c.serverCache,
 	)
 	if err != nil {
 		klog.ErrorS(err, "create routes provider", "networkID", c.networkID)
@@ -239,11 +253,11 @@ func (c *cloud) HasClusterID() bool {
 // serverIsAttachedToNetwork checks if the server where the master is running on is attached to the configured private network
 // We use this measurement to protect users against some parts of misconfiguration, like configuring a master in a not attached
 // network.
-func serverIsAttachedToNetwork(metadataClient *metadata.Client, networkID int64) (bool, error) {
+func serverIsAttachedToNetwork(ctx context.Context, metadataClient *metadata.Client, networkID int64) (bool, error) {
 	const op = "serverIsAttachedToNetwork"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
 
-	serverPrivateNetworks, err := metadataClient.PrivateNetworks()
+	serverPrivateNetworks, err := metadataClient.PrivateNetworksWithContext(ctx)
 	if err != nil {
 		return false, fmt.Errorf("%s: %w", op, err)
 	}

@@ -17,19 +17,19 @@ jobs:
           - v4.0.0 # renovate: datasource=github-releases depName=helm/helm versioning=same-major
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: 3.x
 
-      - uses: yokawasa/action-setup-kube-tools@v0.13.1
+      - uses: yokawasa/action-setup-kube-tools@b16d49b2c459d33cf9d4c300a220ef0bcdbc730a # v0.14.0
         with:
           setup-tools: |
             helm
           helm: ${{ matrix.helm }}
 
-      - uses: pre-commit/action@v3.0.1
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
         with:
           extra_args: none || true
 
@@ -46,13 +46,13 @@ jobs:
       # Helm lints are executed in a separate action with a version matrix
       SKIP: "helm-lint,helm-snapshots,deploy-manifests"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: 3.x
 
-      - uses: actions/cache@v5
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cache/golangci-lint
           key: pre-commit-golangci-lint|${{ env.pythonLocation }}|${{ hashFiles('.pre-commit-config.yaml') }}|${{ hashFiles('**/*.go') }}
@@ -61,4 +61,4 @@ jobs:
             pre-commit-golangci-lint|${{ env.pythonLocation }}|
             pre-commit-golangci-lint|
 
-      - uses: pre-commit/action@v3.0.1
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1

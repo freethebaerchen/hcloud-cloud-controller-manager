@@ -22,28 +22,31 @@ import (
 	"fmt"
 	"net"
 
+	hrobot "github.com/syself/hrobot-go"
 	hrobotmodels "github.com/syself/hrobot-go/models"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/klog/v2"
 
+	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/cache"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/config"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/legacydatacenter"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/metrics"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/providerid"
-	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/robot"
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 )
 
 const (
 	ProvidedBy              = "instance.hetzner.cloud/provided-by"
 	MisconfiguredInternalIP = "MisconfiguredInternalIP"
+	instancesV2Subsystem    = "instances_v2"
 )
 
 type instances struct {
 	client      *hcloud.Client
-	robotClient robot.Client
+	robotClient hrobot.RobotClient
+	serverCache *cache.Cache[hcloud.Server]
 	recorder    record.EventRecorder
 	networkID   int64
 	cfg         config.HCCMConfiguration
@@ -56,7 +59,8 @@ var (
 
 func newInstances(
 	client *hcloud.Client,
-	robotClient robot.Client,
+	robotClient hrobot.RobotClient,
+	serverCache *cache.Cache[hcloud.Server],
 	recorder record.EventRecorder,
 	networkID int64,
 	cfg config.HCCMConfiguration,
@@ -64,6 +68,7 @@ func newInstances(
 	return &instances{
 		client,
 		robotClient,
+		serverCache,
 		recorder,
 		networkID,
 		cfg,
@@ -77,16 +82,17 @@ func (i *instances) lookupServer(
 	ctx context.Context,
 	node *corev1.Node,
 ) (genericServer, error) {
+	ctx = cache.SetSubsystem(ctx, instancesV2Subsystem)
+
 	if node.Spec.ProviderID != "" {
 		var serverID int64
 		serverID, isCloudServer, err := providerid.ToServerID(node.Spec.ProviderID)
-
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert provider id to server id: %w", err)
 		}
 
 		if isCloudServer {
-			server, err := getCloudServerByID(ctx, i.client, serverID)
+			server, err := i.serverCache.ByID(ctx, serverID)
 			if err != nil {
 				return nil, fmt.Errorf("failed to get hcloud server \"%d\": %w", serverID, err)
 			}
@@ -115,7 +121,7 @@ func (i *instances) lookupServer(
 
 	// If the node has no provider ID we try to find the server by name from
 	// both sources. In case we find two servers, we return an error.
-	cloudServer, err := getCloudServerByName(ctx, i.client, node.Name)
+	cloudServer, err := i.serverCache.ByName(ctx, node.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get hcloud server %q: %w", node.Name, err)
 	}
@@ -153,6 +159,7 @@ func (i *instances) lookupServer(
 func (i *instances) InstanceExists(ctx context.Context, node *corev1.Node) (bool, error) {
 	const op = "hcloud/instancesv2.InstanceExists"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
+	klog.V(4).InfoS("InstanceExists called", "node", node.Name, "providerID", node.Spec.ProviderID)
 
 	server, err := i.lookupServer(ctx, node)
 	if err != nil {
@@ -165,6 +172,7 @@ func (i *instances) InstanceExists(ctx context.Context, node *corev1.Node) (bool
 func (i *instances) InstanceShutdown(ctx context.Context, node *corev1.Node) (bool, error) {
 	const op = "hcloud/instancesv2.InstanceShutdown"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
+	klog.V(4).InfoS("InstanceShutdown called", "node", node.Name, "providerID", node.Spec.ProviderID)
 
 	server, err := i.lookupServer(ctx, node)
 	if err != nil {
@@ -174,7 +182,8 @@ func (i *instances) InstanceShutdown(ctx context.Context, node *corev1.Node) (bo
 	if server == nil {
 		return false, fmt.Errorf(
 			"%s: failed to get instance metadata: no matching server found for node '%s': %w",
-			op, node.Name, errServerNotFound)
+			op, node.Name, errServerNotFound,
+		)
 	}
 
 	isShutdown, err := server.IsShutdown()
@@ -188,6 +197,7 @@ func (i *instances) InstanceShutdown(ctx context.Context, node *corev1.Node) (bo
 func (i *instances) InstanceMetadata(ctx context.Context, node *corev1.Node) (*cloudprovider.InstanceMetadata, error) {
 	const op = "hcloud/instancesv2.InstanceMetadata"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
+	klog.V(4).InfoS("InstanceMetadata called", "node", node.Name, "providerID", node.Spec.ProviderID)
 
 	server, err := i.lookupServer(ctx, node)
 	if err != nil {
@@ -197,7 +207,8 @@ func (i *instances) InstanceMetadata(ctx context.Context, node *corev1.Node) (*c
 	if server == nil {
 		return nil, fmt.Errorf(
 			"%s: failed to get instance metadata: no matching server found for node '%s': %w",
-			op, node.Name, errServerNotFound)
+			op, node.Name, errServerNotFound,
+		)
 	}
 
 	metadata, err := server.Metadata(i.networkID, node, i.cfg)
@@ -359,7 +370,7 @@ func (s hcloudServer) Metadata(networkID int64, _ *corev1.Node, cfg config.HCCMC
 
 type robotServer struct {
 	*hrobotmodels.Server
-	robotClient robot.Client
+	robotClient hrobot.RobotClient
 	recorder    record.EventRecorder
 }
 

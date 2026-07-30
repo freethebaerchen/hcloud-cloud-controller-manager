@@ -2,37 +2,42 @@ package hcloud
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"time"
 
-	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/record"
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/klog/v2"
 
-	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/hcops"
+	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/cache"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/metrics"
+	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/providerid"
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 )
 
-var (
-	serversCacheMissRefreshRate = rate.Every(30 * time.Second)
-)
+// routeTargetCacheMaxAge overrides the shared server cache's short default max age
+// for route reconciliation. The routes controller only reads the server's
+// slow-changing private-net attachment, so it can tolerate staler entries and skip
+// an extra API call. ListRoutes refreshes the cache first, so CreateRoute has less
+// need for an additional refresh.
+const routeTargetCacheMaxAge = 1 * time.Minute
 
 type routes struct {
 	client      *hcloud.Client
 	network     *hcloud.Network
-	serverCache *hcops.AllServersCache
+	serverCache *cache.Cache[hcloud.Server]
 	clusterCIDR *net.IPNet
 	recorder    record.EventRecorder
+	nodeLister  corelisters.NodeLister
 }
 
-func newRoutes(client *hcloud.Client, networkID int64, clusterCIDR string, recorder record.EventRecorder) (*routes, error) {
+func newRoutes(client *hcloud.Client, networkID int64, clusterCIDR string, recorder record.EventRecorder, nodeLister corelisters.NodeLister, serverCache *cache.Cache[hcloud.Server]) (*routes, error) {
 	const op = "hcloud/newRoutes"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
 
@@ -50,17 +55,12 @@ func newRoutes(client *hcloud.Client, networkID int64, clusterCIDR string, recor
 	}
 
 	return &routes{
-		client:  client,
-		network: networkObj,
-		serverCache: &hcops.AllServersCache{
-			// client.Server.All will load ALL the servers in the project, even those
-			// that are not part of the Kubernetes cluster.
-			LoadFunc:                client.Server.All,
-			Network:                 networkObj,
-			CacheMissRefreshLimiter: rate.NewLimiter(serversCacheMissRefreshRate, 1),
-		},
+		client:      client,
+		network:     networkObj,
+		serverCache: serverCache,
 		clusterCIDR: cidr,
 		recorder:    recorder,
+		nodeLister:  nodeLister,
 	}, nil
 }
 
@@ -83,111 +83,199 @@ func (r *routes) reloadNetwork(ctx context.Context) error {
 func (r *routes) ListRoutes(ctx context.Context, _ string) ([]*cloudprovider.Route, error) {
 	const op = "hcloud/ListRoutes"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
+	ctx = cache.SetSubsystem(ctx, "routes")
 
 	if err := r.reloadNetwork(ctx); err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 
+	servers, err := r.serverCache.All(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%s: error fetching servers: %w", op, err)
+	}
+
+	serversByPrivateIP := make(map[string]*hcloud.Server, len(servers))
+	for _, server := range servers {
+		if privateNet := server.PrivateNetFor(r.network); privateNet != nil {
+			serversByPrivateIP[privateNet.IP.String()] = server
+		}
+	}
+
 	routes := make([]*cloudprovider.Route, 0, len(r.network.Routes))
 	for _, route := range r.network.Routes {
-		ro, err := r.hcloudRouteToRoute(ctx, route)
-		if err != nil {
-			return routes, fmt.Errorf("%s: %w", op, err)
+		cpRoute := &cloudprovider.Route{
+			DestinationCIDR: route.Destination.String(),
+			Name:            fmt.Sprintf("%s-%s", route.Gateway.String(), route.Destination.String()),
 		}
-		routes = append(routes, ro)
+
+		server, ok := serversByPrivateIP[route.Gateway.String()]
+		if ok {
+			cpRoute.TargetNode = types.NodeName(server.Name)
+		} else {
+			// Route belongs to non-existing target
+			cpRoute.Blackhole = true
+		}
+		routes = append(routes, cpRoute)
 	}
+
 	return routes, nil
 }
 
 // CreateRoute creates the described managed route
 // route.Name will be ignored, although the cloud-provider may use nameHint
 // to create a more user-meaningful name.
-func (r *routes) CreateRoute(ctx context.Context, clusterName string, nameHint string, route *cloudprovider.Route) error {
+func (r *routes) CreateRoute(ctx context.Context, _ string, _ string, route *cloudprovider.Route) error {
 	const op = "hcloud/CreateRoute"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
+	ctx = cache.SetSubsystem(ctx, "routes")
 
-	srv, err := r.serverCache.ByName(ctx, string(route.TargetNode))
+	// Parse and return early if we detect IPv6 routes.
+	// Private Networks don't support IPv6, so we can save an API
+	// request by validating beforehand.
+	ip, ipNet, err := net.ParseCIDR(route.DestinationCIDR)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
-
-	privNet, ok := findServerPrivateNetByID(srv, r.network.ID)
-	if !ok {
-		r.serverCache.InvalidateCache()
-		srv, err = r.serverCache.ByName(ctx, string(route.TargetNode))
-		if err != nil {
-			return fmt.Errorf("%s: %w", op, err)
-		}
-
-		privNet, ok = findServerPrivateNetByID(srv, r.network.ID)
-		if !ok {
-			return fmt.Errorf("%s: server %v: network with id %d not attached to this server", op, route.TargetNode, r.network.ID)
-		}
-	}
-	ip := privNet.IP
-
-	_, cidr, err := net.ParseCIDR(route.DestinationCIDR)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	clusterNetSize, _ := r.clusterCIDR.Mask.Size()
-	destNetSize, _ := cidr.Mask.Size()
-
-	if !r.clusterCIDR.Contains(cidr.IP) || destNetSize < clusterNetSize {
-		node := &corev1.Node{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      string(route.TargetNode),
-				Namespace: "",
-			},
-		}
-		// Event is only visible via `kubectl get events` and not `kubectl describe node`,
-		// as we do not have the UID here and `kubectl describe node` filters by UID.
-		// Because of this behavior we are also dispatching a log message.
-		r.recorder.Eventf(
-			node,
-			corev1.EventTypeWarning,
-			"ClusterCIDRMisconfigured",
-			"route CIDR %s is not contained within cluster CIDR %s",
-			route.DestinationCIDR,
-			r.clusterCIDR.String(),
-		)
-		klog.Warningf(
-			"route CIDR %s is not contained within cluster CIDR %s",
-			route.DestinationCIDR,
-			r.clusterCIDR.String(),
+	if ip.To4() == nil {
+		return fmt.Errorf(
+			"%s: can't create route %q via node %q: private networks do not support IPv6",
+			op,
+			ipNet.String(),
+			route.TargetNode,
 		)
 	}
 
-	doesRouteAlreadyExist, err := r.checkIfRouteAlreadyExists(ctx, route)
+	node, gateway, err := r.resolveRouteTarget(ctx, string(route.TargetNode))
 	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
+		return fmt.Errorf("%s: error resolving route target: %w", op, err)
 	}
 
-	if !doesRouteAlreadyExist {
-		opts := hcloud.NetworkAddRouteOpts{
-			Route: hcloud.NetworkRoute{
-				Destination: cidr,
-				Gateway:     ip,
-			},
-		}
-		action, _, err := r.client.Network.AddRoute(ctx, r.network, opts)
+	if !slices.ContainsFunc(route.TargetNodeAddresses, func(target corev1.NodeAddress) bool {
+		return target.Type == corev1.NodeInternalIP && target.Address == gateway.String()
+	}) {
+		return fmt.Errorf("%s: IP %s not part of routes target addresses", op, gateway.String())
+	}
+
+	r.warnCIDRMismatch(ipNet, node)
+
+	if err := r.upsertRoute(ctx, gateway, ipNet, string(route.TargetNode)); err != nil {
+		return fmt.Errorf("error upserting route %q via %q: %w", ipNet.String(), gateway.String(), err)
+	}
+
+	return nil
+}
+
+// resolveRouteTarget returns the k8s node and the hcloud server's private IP on the routes
+// network — everything needed to create a route for this node (gateway IP) and record events
+// against it (node).
+//
+// The hcloud server is resolved by ProviderID. Nodes without a ProviderID yet are
+// looked up by name as a fallback. Refreshes the cache once if the
+// private-net attachment isn't yet reflected.
+func (r *routes) resolveRouteTarget(ctx context.Context, nodeName string) (*corev1.Node, net.IP, error) {
+	node, err := r.nodeLister.Get(nodeName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error fetching node %s by name: %w", nodeName, err)
+	}
+
+	var server *hcloud.Server
+	if node.Spec.ProviderID != "" {
+		id, isCloudServer, err := providerid.ToServerID(node.Spec.ProviderID)
 		if err != nil {
-			if hcloud.IsError(err, hcloud.ErrorCodeLocked, hcloud.ErrorCodeConflict) {
-				retryDelay := time.Second * 5
-				klog.InfoS("retry due to conflict or lock",
-					"op", op, "delay", fmt.Sprintf("%v", retryDelay), "err", fmt.Sprintf("%v", err))
-				time.Sleep(retryDelay)
+			return nil, nil, fmt.Errorf("error parsing provider id %q for node %s: %w", node.Spec.ProviderID, nodeName, err)
+		}
+		if !isCloudServer {
+			return nil, nil, fmt.Errorf("node %s is not a cloud server, routes are only supported for cloud servers", node.Name)
+		}
+		server, err = r.serverCache.ByID(ctx, id, cache.WithMaxAge(routeTargetCacheMaxAge))
+		if err != nil {
+			return nil, nil, fmt.Errorf("error looking up hcloud server by id %d for node %s: %w", id, nodeName, err)
+		}
+	} else {
+		server, err = r.serverCache.ByName(ctx, node.Name, cache.WithMaxAge(routeTargetCacheMaxAge))
+		if err != nil {
+			return nil, nil, fmt.Errorf("error looking up hcloud server by name for node %s: %w", nodeName, err)
+		}
+	}
 
-				return r.CreateRoute(ctx, clusterName, nameHint, route)
-			}
-			return fmt.Errorf("%s: %w", op, err)
+	// The cache returns (nil, nil) when the server does not exist (e.g. it was deleted).
+	if server == nil {
+		return nil, nil, fmt.Errorf("hcloud server for node %s not found", nodeName)
+	}
+
+	// CreateRoute may fail if the Server is not yet attached to the
+	// Private Network. In that case it returns an error and is retried;
+	// ListRoutes runs first and refreshes the cache.
+	privNet := server.PrivateNetFor(r.network)
+	if privNet == nil {
+		return nil, nil, fmt.Errorf("server %s (%d): network with id %d not attached to this server", server.Name, server.ID, r.network.ID)
+	}
+
+	return node, privNet.IP, nil
+}
+
+// upsertRoute ensures the hcloud network has a route for cidr pointing at gateway. A matching
+// route is a no-op; a stale route with a different gateway is replaced in place. nodeName is
+// used only for logging and for surfacing API conflicts against the right k8s object.
+func (r *routes) upsertRoute(ctx context.Context, gateway net.IP, cidr *net.IPNet, nodeName string) error {
+	if err := r.reloadNetwork(ctx); err != nil {
+		return fmt.Errorf("error reloading network: %w", err)
+	}
+
+	destination := cidr.String()
+	existingIdx := slices.IndexFunc(r.network.Routes, func(nr hcloud.NetworkRoute) bool {
+		return nr.Destination.String() == destination
+	})
+	if existingIdx >= 0 {
+		existing := r.network.Routes[existingIdx]
+		if existing.Gateway.Equal(gateway) {
+			klog.InfoS(
+				"route already exists: skipping creation",
+				"target-node", nodeName,
+				"destination-cidr", destination,
+			)
+			return nil
 		}
 
+		action, _, err := r.client.Network.DeleteRoute(ctx, r.network, hcloud.NetworkDeleteRouteOpts{
+			Route: existing,
+		})
+		if err != nil {
+			return fmt.Errorf("error deleting route for %q via %q: %w", cidr.String(), gateway.String(), err)
+		}
 		if err := r.client.Action.WaitFor(ctx, action); err != nil {
-			return fmt.Errorf("%s: %w", op, err)
+			return fmt.Errorf("error deleting route for %q via %q: %w", cidr.String(), gateway.String(), err)
 		}
+		klog.InfoS(
+			"deleted stale route with wrong gateway; recreating",
+			"node", nodeName,
+			"gateway", gateway,
+			"cidr", destination,
+		)
 	}
+
+	opts := hcloud.NetworkAddRouteOpts{
+		Route: hcloud.NetworkRoute{
+			Destination: cidr,
+			Gateway:     gateway,
+		},
+	}
+	action, _, err := r.client.Network.AddRoute(ctx, r.network, opts)
+	if err != nil {
+		if hcloud.IsError(err, hcloud.ErrorCodeLocked, hcloud.ErrorCodeConflict) {
+			return apierrors.NewConflict(
+				corev1.Resource("nodes"),
+				nodeName,
+				err,
+			)
+		}
+		return fmt.Errorf("error adding route for %q via %q: %w", cidr.String(), gateway.String(), err)
+	}
+
+	if err := r.client.Action.WaitFor(ctx, action); err != nil {
+		return fmt.Errorf("error adding route for %q via %q: %w", cidr.String(), gateway.String(), err)
+	}
+
 	return nil
 }
 
@@ -214,17 +302,6 @@ func (r *routes) DeleteRoute(ctx context.Context, _ string, route *cloudprovider
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	err = r.deleteRouteFromHcloud(ctx, cidr, ip)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-	return nil
-}
-
-func (r *routes) deleteRouteFromHcloud(ctx context.Context, cidr *net.IPNet, ip net.IP) error {
-	const op = "hcloud/deleteRouteFromHcloud"
-	metrics.OperationCalled.WithLabelValues(op).Inc()
-
 	opts := hcloud.NetworkDeleteRouteOpts{
 		Route: hcloud.NetworkRoute{
 			Destination: cidr,
@@ -234,14 +311,6 @@ func (r *routes) deleteRouteFromHcloud(ctx context.Context, cidr *net.IPNet, ip 
 
 	action, _, err := r.client.Network.DeleteRoute(ctx, r.network, opts)
 	if err != nil {
-		if hcloud.IsError(err, hcloud.ErrorCodeLocked, hcloud.ErrorCodeConflict) {
-			retryDelay := time.Second * 5
-			klog.InfoS("retry due to conflict or lock",
-				"op", op, "delay", fmt.Sprintf("%v", retryDelay), "err", fmt.Sprintf("%v", err))
-			time.Sleep(retryDelay)
-
-			return r.deleteRouteFromHcloud(ctx, cidr, ip)
-		}
 		return fmt.Errorf("%s: %w", op, err)
 	}
 	if err := r.client.Action.WaitFor(ctx, action); err != nil {
@@ -250,74 +319,17 @@ func (r *routes) deleteRouteFromHcloud(ctx context.Context, cidr *net.IPNet, ip 
 	return nil
 }
 
-func (r *routes) hcloudRouteToRoute(ctx context.Context, route hcloud.NetworkRoute) (*cloudprovider.Route, error) {
-	const op = "hcloud/hcloudRouteToRoute"
-	metrics.OperationCalled.WithLabelValues(op).Inc()
+func (r *routes) warnCIDRMismatch(cidr *net.IPNet, node *corev1.Node) {
+	clusterPrefixLen, _ := r.clusterCIDR.Mask.Size()
+	destPrefixLen, _ := cidr.Mask.Size()
 
-	cpRoute := &cloudprovider.Route{
-		DestinationCIDR: route.Destination.String(),
-		Name:            fmt.Sprintf("%s-%s", route.Gateway.String(), route.Destination.String()),
+	if !r.clusterCIDR.Contains(cidr.IP) || destPrefixLen < clusterPrefixLen {
+		warnMsg := fmt.Sprintf(
+			"route CIDR %s is not contained within cluster CIDR %s",
+			cidr.String(),
+			r.clusterCIDR.String(),
+		)
+		klog.Warning(warnMsg)
+		r.recorder.Event(node, corev1.EventTypeWarning, "ClusterCIDRMisconfigured", warnMsg)
 	}
-
-	srv, err := r.serverCache.ByPrivateIP(ctx, route.Gateway)
-	if err != nil {
-		if errors.Is(err, hcops.ErrNotFound) {
-			// Route belongs to non-existing target
-			cpRoute.Blackhole = true
-			return cpRoute, nil
-		}
-
-		return nil, fmt.Errorf("%s: %w", op, err)
-	}
-
-	cpRoute.TargetNode = types.NodeName(srv.Name)
-	return cpRoute, nil
-}
-
-func (r *routes) checkIfRouteAlreadyExists(ctx context.Context, route *cloudprovider.Route) (bool, error) {
-	const op = "hcloud/checkIfRouteAlreadyExists"
-	metrics.OperationCalled.WithLabelValues(op).Inc()
-
-	if err := r.reloadNetwork(ctx); err != nil {
-		return false, fmt.Errorf("%s: %w", op, err)
-	}
-
-	for _, _route := range r.network.Routes {
-		if _route.Destination.String() == route.DestinationCIDR {
-			srv, err := r.serverCache.ByName(ctx, string(route.TargetNode))
-			if err != nil {
-				return false, fmt.Errorf("%s: %w", op, err)
-			}
-			privNet, ok := findServerPrivateNetByID(srv, r.network.ID)
-			if !ok {
-				return false, fmt.Errorf("%s: server %v: no network with id: %d", op, route.TargetNode, r.network.ID)
-			}
-			ip := privNet.IP
-
-			if !_route.Gateway.Equal(ip) {
-				action, _, err := r.client.Network.DeleteRoute(ctx, r.network, hcloud.NetworkDeleteRouteOpts{
-					Route: _route,
-				})
-				if err != nil {
-					return false, fmt.Errorf("%s: %w", op, err)
-				}
-
-				if err := r.client.Action.WaitFor(ctx, action); err != nil {
-					return false, fmt.Errorf("%s: %w", op, err)
-				}
-			}
-
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func findServerPrivateNetByID(srv *hcloud.Server, id int64) (hcloud.ServerPrivateNet, bool) {
-	for _, n := range srv.PrivateNet {
-		if n.Network.ID == id {
-			return n, true
-		}
-	}
-	return hcloud.ServerPrivateNet{}, false
 }

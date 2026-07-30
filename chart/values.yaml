@@ -120,9 +120,35 @@ resources:
     cpu: 100m
     memory: 50Mi
 
+# Pod-level security context for the hccm Pod.
+# See https://kubernetes.io/docs/tasks/configure-pod-container/security-context/
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context for the hccm container.
+# See https://kubernetes.io/docs/tasks/configure-pod-container/security-context/
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
 selectorLabels:
   app.kubernetes.io/name: '{{ include "hcloud-cloud-controller-manager.name" $ }}'
   app.kubernetes.io/instance: "{{ $.Release.Name }}"
+
+# Deployment strategy for the hccm Pod.
+# See https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#strategy
+strategy: {}
+#   type: RollingUpdate
+#   rollingUpdate:
+#     maxSurge: 1
+#     maxUnavailable: 1
 
 additionalTolerations: []
 
@@ -144,6 +170,11 @@ robot:
 rbac:
   # Create a cluster role binding with admin access for the service account.
   create: true
+
+serviceAccount:
+  # Annotations to add to the service account.
+  # See https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/
+  annotations: {}
 
 podLabels: {}
 
