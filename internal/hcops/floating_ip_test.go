@@ -342,6 +342,104 @@ func TestFloatingIPOps_GetByK8SServiceUIDAndType(t *testing.T) {
 	})
 }
 
+func TestFloatingIPOps_Create(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("sets name from generic annotation", func(t *testing.T) {
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:         "svc-uid-123",
+				Annotations: map[string]string{string(annotation.FIPName): "my-fip"},
+			},
+		}
+		mockFIP := new(mockFloatingIPClient)
+		mockFIP.On("Create", ctx, mock.MatchedBy(func(opts hcloud.FloatingIPCreateOpts) bool {
+			return opts.Name != nil && *opts.Name == "my-fip"
+		})).Return(hcloud.FloatingIPCreateResult{FloatingIP: &hcloud.FloatingIP{ID: 1}}, &hcloud.Response{}, nil)
+
+		ops := &hcops.FloatingIPOps{FIPClient: mockFIP, ActionClient: &mocks.ActionClient{}}
+		_, err := ops.Create(ctx, "nbg1", svc, hcloud.FloatingIPTypeIPv4)
+		assert.NoError(t, err)
+		mockFIP.AssertExpectations(t)
+	})
+
+	t.Run("type-specific overrides generic", func(t *testing.T) {
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				UID: "svc-uid-123",
+				Annotations: map[string]string{
+					string(annotation.FIPName):     "generic",
+					string(annotation.FIPNameIPv4): "ipv4-fip",
+					string(annotation.FIPNameIPv6): "ipv6-fip",
+				},
+			},
+		}
+		mockFIP := new(mockFloatingIPClient)
+		mockFIP.On("Create", ctx, mock.MatchedBy(func(opts hcloud.FloatingIPCreateOpts) bool {
+			return opts.Name != nil && *opts.Name == "ipv4-fip"
+		})).Return(hcloud.FloatingIPCreateResult{FloatingIP: &hcloud.FloatingIP{ID: 1}}, &hcloud.Response{}, nil)
+
+		ops := &hcops.FloatingIPOps{FIPClient: mockFIP, ActionClient: &mocks.ActionClient{}}
+		_, err := ops.Create(ctx, "nbg1", svc, hcloud.FloatingIPTypeIPv4)
+		assert.NoError(t, err)
+		mockFIP.AssertExpectations(t)
+
+		mockFIP2 := new(mockFloatingIPClient)
+		svc2 := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				UID: "svc-uid-123",
+				Annotations: map[string]string{
+					string(annotation.FIPName):     "generic",
+					string(annotation.FIPNameIPv4): "ipv4-fip",
+					string(annotation.FIPNameIPv6): "ipv6-fip",
+				},
+			},
+		}
+		mockFIP2.On("Create", ctx, mock.MatchedBy(func(opts hcloud.FloatingIPCreateOpts) bool {
+			return opts.Name != nil && *opts.Name == "ipv6-fip"
+		})).Return(hcloud.FloatingIPCreateResult{FloatingIP: &hcloud.FloatingIP{ID: 2}}, &hcloud.Response{}, nil)
+
+		ops2 := &hcops.FloatingIPOps{FIPClient: mockFIP2, ActionClient: &mocks.ActionClient{}}
+		_, err2 := ops2.Create(ctx, "nbg1", svc2, hcloud.FloatingIPTypeIPv6)
+		assert.NoError(t, err2)
+		mockFIP2.AssertExpectations(t)
+	})
+
+	t.Run("falls back to generic for type without specific", func(t *testing.T) {
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				UID: "svc-uid-123",
+				Annotations: map[string]string{
+					string(annotation.FIPName):     "generic",
+					string(annotation.FIPNameIPv6): "ipv6-fip",
+				},
+			},
+		}
+		mockFIP := new(mockFloatingIPClient)
+		mockFIP.On("Create", ctx, mock.MatchedBy(func(opts hcloud.FloatingIPCreateOpts) bool {
+			return opts.Name != nil && *opts.Name == "generic"
+		})).Return(hcloud.FloatingIPCreateResult{FloatingIP: &hcloud.FloatingIP{ID: 1}}, &hcloud.Response{}, nil)
+
+		ops := &hcops.FloatingIPOps{FIPClient: mockFIP, ActionClient: &mocks.ActionClient{}}
+		_, err := ops.Create(ctx, "nbg1", svc, hcloud.FloatingIPTypeIPv4)
+		assert.NoError(t, err)
+		mockFIP.AssertExpectations(t)
+	})
+
+	t.Run("name not set when annotation missing", func(t *testing.T) {
+		mockFIP := new(mockFloatingIPClient)
+		mockFIP.On("Create", ctx, mock.MatchedBy(func(opts hcloud.FloatingIPCreateOpts) bool {
+			return opts.Name == nil
+		})).Return(hcloud.FloatingIPCreateResult{FloatingIP: &hcloud.FloatingIP{ID: 1}}, &hcloud.Response{}, nil)
+
+		ops := &hcops.FloatingIPOps{FIPClient: mockFIP, ActionClient: &mocks.ActionClient{}}
+		svcNoAnn := &corev1.Service{ObjectMeta: metav1.ObjectMeta{UID: "svc-uid-456"}}
+		_, err := ops.Create(ctx, "nbg1", svcNoAnn, hcloud.FloatingIPTypeIPv4)
+		assert.NoError(t, err)
+		mockFIP.AssertExpectations(t)
+	})
+}
+
 func TestFloatingIPOps_GetAllByK8SServiceUID(t *testing.T) {
 	ctx := context.Background()
 	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{UID: "svc-uid-123"}}

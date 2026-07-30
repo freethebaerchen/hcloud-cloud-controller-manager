@@ -39,6 +39,27 @@ const (
 	// Type: string
 	FIPLocation Name = "floating-ip.hetzner.cloud/location"
 
+	// FIPName is the name to assign to the Floating IP. Used as a fallback
+	// when the type-specific annotation (FIPNameIPv4 / FIPNameIPv6) is not set.
+	// If neither is set, no name is assigned and Hetzner will use the IP
+	// address as the name.
+	//
+	// Type: string
+	// Default: ""
+	FIPName Name = "floating-ip.hetzner.cloud/name"
+
+	// FIPNameIPv4 is the name to assign to the IPv4 Floating IP. Overrides
+	// the generic FIPName annotation.
+	//
+	// Type: string
+	FIPNameIPv4 Name = "floating-ip.hetzner.cloud/name-ipv4"
+
+	// FIPNameIPv6 is the name to assign to the IPv6 Floating IP. Overrides
+	// the generic FIPName annotation.
+	//
+	// Type: string
+	FIPNameIPv6 Name = "floating-ip.hetzner.cloud/name-ipv6"
+
 	// FIPPublicIP is the public IP address of the Floating IP. Set by the
 	// Cloud Controller Manager.
 	//

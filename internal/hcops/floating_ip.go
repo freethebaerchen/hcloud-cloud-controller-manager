@@ -97,6 +97,9 @@ func (f *FloatingIPOps) Create(ctx context.Context, location string, svc *corev1
 			LabelCCMManaged:     "true",
 		},
 	}
+	if name, ok := fipName(svc, typ); ok && name != "" {
+		opts.Name = &name
+	}
 	result, _, err := f.FIPClient.Create(ctx, opts)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
@@ -270,4 +273,20 @@ func (f *FloatingIPOps) RecordEvent(svc *corev1.Service, eventType, reason, mess
 	if f.Recorder != nil {
 		f.Recorder.Eventf(svc, eventType, reason, "%s", message)
 	}
+}
+
+// fipName returns the name for a Floating IP based on its type and service annotations.
+// Priority: type-specific annotation > generic FIPName annotation > empty.
+func fipName(svc *corev1.Service, typ hcloud.FloatingIPType) (string, bool) {
+	switch typ {
+	case hcloud.FloatingIPTypeIPv4:
+		if v, ok := annotation.FIPNameIPv4.StringFromService(svc); ok && v != "" {
+			return v, true
+		}
+	case hcloud.FloatingIPTypeIPv6:
+		if v, ok := annotation.FIPNameIPv6.StringFromService(svc); ok && v != "" {
+			return v, true
+		}
+	}
+	return annotation.FIPName.StringFromService(svc)
 }
