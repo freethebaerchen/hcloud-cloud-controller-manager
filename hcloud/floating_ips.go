@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"net"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -112,17 +114,45 @@ func (l *loadBalancers) deleteFloatingIPs(ctx context.Context, op string, svc *c
 	return nil
 }
 
+// autoAllocateIPv6 derives a deterministic IPv6 address from the Service UID
+// within the given /64 network. Returns a base + suffix like "2a01:4f8:1c17:a025::1".
+func autoAllocateIPv6(svc *corev1.Service, base net.IP) string {
+	if base == nil || base.To4() != nil {
+		return "::1"
+	}
+	baseStr := base.String()
+	if !strings.HasSuffix(baseStr, "::") {
+		return baseStr
+	}
+	h := fnv.New64a()
+	h.Write([]byte(svc.ObjectMeta.UID))
+	// Use the low 16 bits of the hash as a compact IPv6 hextet host suffix,
+	// e.g. "1", "a3", "4f2b". This keeps the derived address valid as a single
+	// group after the "::" of the /64 base (a group is at most 4 hex digits).
+	host := uint16(h.Sum64())
+	if host == 0 {
+		host = 1
+	}
+	return baseStr + strconv.FormatUint(uint64(host), 16)
+}
+
 // getIPv6AddressForIngress returns the IPv6 address to use in ingress when using
 // FIP-only (e.g. load balancer disabled).
 //
 // Behaviour:
+//   - If floating-ip.hetzner.cloud/ipv6-auto-allocate is true, derive a unique
+//     address from the Service UID, overriding FIPIPv6Address.
 //   - If floating-ip.hetzner.cloud/ipv6-address is a full IPv6 address, use it.
 //   - If it is a suffix without ":", append it to the IPv6 block of base (e.g. base
 //     "2a01:4f8:1c17:b0b0::" + suffix "1" => "2a01:4f8:1c17:b0b0::1").
 //   - If the annotation is missing/invalid:
-//     * use base (if non-nil IPv6), otherwise "::1".
+//   - use base (if non-nil IPv6), otherwise "::1".
 func getIPv6AddressForIngress(svc *corev1.Service, base net.IP) string {
 	const defaultIPv6 = "::1"
+
+	if auto, err := annotation.FIPIPv6AutoAllocate.BoolFromService(svc); err == nil && auto {
+		return autoAllocateIPv6(svc, base)
+	}
 
 	v, ok := annotation.FIPIPv6Address.StringFromService(svc)
 	if !ok || v == "" {

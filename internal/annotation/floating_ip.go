@@ -60,6 +60,15 @@ const (
 	// Type: string
 	FIPNameIPv6 Name = "floating-ip.hetzner.cloud/name-ipv6"
 
+	// FIPIPv6AutoAllocate enables automatic allocation of a unique IPv6 address
+	// from the Floating IP's /64 network for each Service. When enabled, it
+	// overrides FIPIPv6Address. Each Service gets a deterministic address
+	// derived from its UID.
+	//
+	// Type: bool
+	// Default: false
+	FIPIPv6AutoAllocate Name = "floating-ip.hetzner.cloud/ipv6-auto-allocate"
+
 	// FIPPublicIP is the public IP address of the Floating IP. Set by the
 	// Cloud Controller Manager.
 	//

@@ -365,8 +365,12 @@ func (l *loadBalancers) buildLoadBalancerStatusIngress(lb *hcloud.LoadBalancer, 
 	for _, fip := range fips {
 		if fip != nil && fip.IP != nil {
 			ipStr := fip.IP.String()
-			if fip.IP.To4() == nil && strings.HasSuffix(ipStr, "::") {
-				ipStr += "1"
+			if fip.IP.To4() == nil {
+				if auto, err := annotation.FIPIPv6AutoAllocate.BoolFromService(svc); err == nil && auto {
+					ipStr = autoAllocateIPv6(svc, fip.IP)
+				} else if strings.HasSuffix(ipStr, "::") {
+					ipStr += "1"
+				}
 			}
 			ingress = append(ingress, corev1.LoadBalancerIngress{
 				IP:     ipStr,
