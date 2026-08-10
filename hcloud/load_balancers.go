@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -116,18 +115,15 @@ func (l *loadBalancers) GetLoadBalancer(
 	metrics.OperationCalled.WithLabelValues(op).Inc()
 
 	if !loadBalancerEnabled(service) {
-		// No HCloud LB; report status from hostname or Floating IPs only.
+		// No HCloud LB; report status from hostname only. Floating IPs are
+		// attached to nodes for external routing but never published as
+		// service IPs (another controller, e.g. MetalLB, manages those).
 		if v, ok := annotation.LBHostname.StringFromService(service); ok {
 			return &corev1.LoadBalancerStatus{
 				Ingress: []corev1.LoadBalancerIngress{{Hostname: v}},
 			}, true, nil
 		}
-		var fips []*hcloud.FloatingIP
-		if l.fipOps != nil && hcops.FloatingIPEnabled(service) {
-			fips, _ = l.fipOps.GetAllByK8SServiceUID(ctx, service)
-		}
-		ingress := buildIngressFromFIPsOnly(fips, service)
-		return &corev1.LoadBalancerStatus{Ingress: ingress}, len(ingress) > 0, nil
+		return &corev1.LoadBalancerStatus{}, false, nil
 	}
 
 	lb, err := l.lbOps.GetByK8SServiceUID(ctx, service)
@@ -144,11 +140,7 @@ func (l *loadBalancers) GetLoadBalancer(
 		}, true, nil
 	}
 
-	var fips []*hcloud.FloatingIP
-	if l.fipOps != nil && hcops.FloatingIPEnabled(service) {
-		fips, _ = l.fipOps.GetAllByK8SServiceUID(ctx, service)
-	}
-	ingress, err := l.buildLoadBalancerStatusIngress(lb, service, fips)
+	ingress, err := l.buildLoadBalancerStatusIngress(lb, service)
 	if err != nil {
 		return nil, false, fmt.Errorf("%s: %w", op, err)
 	}
@@ -180,12 +172,9 @@ func (l *loadBalancers) EnsureLoadBalancer(
 		if err := l.deleteExistingLoadBalancerIfPresent(ctx, op, clusterName, svc); err != nil {
 			return nil, err
 		}
-		// Only handle Floating IPs and return status from them or hostname.
-		var fips []*hcloud.FloatingIP
+		// Only handle Floating IPs; no service IP is published from them.
 		if hcops.FloatingIPEnabled(svc) {
-			var ensureErr error
-			fips, ensureErr = l.ensureFloatingIPs(ctx, op, svc, selectedNodes)
-			if ensureErr != nil {
+			if _, ensureErr := l.ensureFloatingIPs(ctx, op, svc, selectedNodes); ensureErr != nil {
 				return nil, ensureErr
 			}
 		} else if l.fipOps != nil {
@@ -199,7 +188,10 @@ func (l *loadBalancers) EnsureLoadBalancer(
 				Ingress: []corev1.LoadBalancerIngress{{Hostname: v}},
 			}, nil
 		}
-		return &corev1.LoadBalancerStatus{Ingress: buildIngressFromFIPsOnly(fips, svc)}, nil
+		// Floating IPs are attached to nodes for external routing only; no
+		// service IP is published (another controller, e.g. MetalLB, manages
+		// the in-cluster service IP).
+		return &corev1.LoadBalancerStatus{}, nil
 	}
 
 	var (
@@ -283,12 +275,10 @@ func (l *loadBalancers) EnsureLoadBalancer(
 		}
 	}
 
-	// Floating IP: get or create per requested type, reconcile all to same node, then include in status.
-	var fips []*hcloud.FloatingIP
+	// Floating IPs are attached to nodes for external routing; their IPs are
+	// not published in the service status.
 	if hcops.FloatingIPEnabled(svc) {
-		var ensureErr error
-		fips, ensureErr = l.ensureFloatingIPs(ctx, op, svc, selectedNodes)
-		if ensureErr != nil {
+		if _, ensureErr := l.ensureFloatingIPs(ctx, op, svc, selectedNodes); ensureErr != nil {
 			return nil, ensureErr
 		}
 	} else if l.fipOps != nil {
@@ -306,7 +296,7 @@ func (l *loadBalancers) EnsureLoadBalancer(
 		}, nil
 	}
 
-	ingress, err := l.buildLoadBalancerStatusIngress(lb, svc, fips)
+	ingress, err := l.buildLoadBalancerStatusIngress(lb, svc)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
@@ -314,7 +304,7 @@ func (l *loadBalancers) EnsureLoadBalancer(
 	return &corev1.LoadBalancerStatus{Ingress: ingress}, nil
 }
 
-func (l *loadBalancers) buildLoadBalancerStatusIngress(lb *hcloud.LoadBalancer, svc *corev1.Service, fips []*hcloud.FloatingIP) ([]corev1.LoadBalancerIngress, error) {
+func (l *loadBalancers) buildLoadBalancerStatusIngress(lb *hcloud.LoadBalancer, svc *corev1.Service) ([]corev1.LoadBalancerIngress, error) {
 	const op = "hcloud/loadBalancers.getLoadBalancerStatusIngress"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
 
@@ -357,23 +347,6 @@ func (l *loadBalancers) buildLoadBalancerStatusIngress(lb *hcloud.LoadBalancer, 
 		for _, privateNet := range lb.PrivateNet {
 			ingress = append(ingress, corev1.LoadBalancerIngress{
 				IP:     privateNet.IP.String(),
-				IPMode: &ipMode,
-			})
-		}
-	}
-
-	for _, fip := range fips {
-		if fip != nil && fip.IP != nil {
-			ipStr := fip.IP.String()
-			if fip.IP.To4() == nil {
-				if auto, err := annotation.FIPIPv6AutoAllocate.BoolFromService(svc); err == nil && auto {
-					ipStr = autoAllocateIPv6(svc, fip.IP)
-				} else if strings.HasSuffix(ipStr, "::") {
-					ipStr += "1"
-				}
-			}
-			ingress = append(ingress, corev1.LoadBalancerIngress{
-				IP:     ipStr,
 				IPMode: &ipMode,
 			})
 		}

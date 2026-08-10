@@ -4,15 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
-	"net"
-	"strconv"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 
-	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/annotation"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/hcops"
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 )
@@ -112,122 +107,4 @@ func (l *loadBalancers) deleteFloatingIPs(ctx context.Context, op string, svc *c
 		}
 	}
 	return nil
-}
-
-// autoAllocateIPv6 derives a deterministic IPv6 address from the Service UID
-// within the given /64 network. Returns a base + suffix like "2a01:4f8:1c17:a025::1".
-func autoAllocateIPv6(svc *corev1.Service, base net.IP) string {
-	if base == nil || base.To4() != nil {
-		return "::1"
-	}
-	baseStr := base.String()
-	if !strings.HasSuffix(baseStr, "::") {
-		return baseStr
-	}
-	h := fnv.New64a()
-	h.Write([]byte(svc.ObjectMeta.UID))
-	// Use the low 16 bits of the hash as a compact IPv6 hextet host suffix,
-	// e.g. "1", "a3", "4f2b". This keeps the derived address valid as a single
-	// group after the "::" of the /64 base (a group is at most 4 hex digits).
-	host := uint16(h.Sum64())
-	if host == 0 {
-		host = 1
-	}
-	return baseStr + strconv.FormatUint(uint64(host), 16)
-}
-
-// getIPv6AddressForIngress returns the IPv6 address to use in ingress when using
-// FIP-only (e.g. load balancer disabled).
-//
-// Behaviour:
-//   - If floating-ip.hetzner.cloud/ipv6-auto-allocate is true, derive a unique
-//     address from the Service UID, overriding FIPIPv6Address.
-//   - If floating-ip.hetzner.cloud/ipv6-address is a full IPv6 address, use it.
-//   - If it is a suffix without ":", append it to the IPv6 block of base (e.g. base
-//     "2a01:4f8:1c17:b0b0::" + suffix "1" => "2a01:4f8:1c17:b0b0::1").
-//   - If the annotation is missing/invalid:
-//   - use base (if non-nil IPv6), otherwise "::1".
-func getIPv6AddressForIngress(svc *corev1.Service, base net.IP) string {
-	const defaultIPv6 = "::1"
-
-	if auto, err := annotation.FIPIPv6AutoAllocate.BoolFromService(svc); err == nil && auto {
-		return autoAllocateIPv6(svc, base)
-	}
-
-	v, ok := annotation.FIPIPv6Address.StringFromService(svc)
-	if !ok || v == "" {
-		if base != nil && base.To4() == nil {
-			baseStr := base.String()
-			if strings.HasSuffix(baseStr, "::") {
-				return baseStr + "1"
-			}
-			return baseStr
-		}
-		return defaultIPv6
-	}
-
-	// Annotation provides a full IPv6 address.
-	if strings.Contains(v, ":") {
-		ip := net.ParseIP(v)
-		if ip == nil || ip.To4() != nil {
-			if base != nil && base.To4() == nil {
-				return base.String()
-			}
-			return defaultIPv6
-		}
-		return ip.String()
-	}
-
-	// Annotation is treated as suffix without ":"; append to base block if possible.
-	if base != nil && base.To4() == nil {
-		baseStr := base.String()
-		if strings.HasSuffix(baseStr, "::") {
-			candidate := baseStr + v
-			if ip := net.ParseIP(candidate); ip != nil && ip.To4() == nil {
-				return ip.String()
-			}
-		}
-		// Fallback: use base as-is if we cannot construct a better address.
-		return baseStr
-	}
-
-	return defaultIPv6
-}
-
-// buildIngressFromFIPsOnly returns LoadBalancerIngress entries for the given
-// Floating IPs plus a configurable IPv6 entry (either derived from the FIP IPv6
-// block and annotation or a sensible default). Used when load balancer is disabled.
-func buildIngressFromFIPsOnly(fips []*hcloud.FloatingIP, svc *corev1.Service) []corev1.LoadBalancerIngress {
-	ipMode := corev1.LoadBalancerIPModeVIP
-	var ingress []corev1.LoadBalancerIngress
-
-	// Determine base IPv6 block from the first IPv6 Floating IP, if any.
-	var baseIPv6 net.IP
-	for _, fip := range fips {
-		if fip != nil && fip.IP != nil && fip.IP.To4() == nil {
-			baseIPv6 = fip.IP
-			break
-		}
-	}
-
-	// First IPv6 entry (derived from base + annotation or default).
-	ipv6Addr := getIPv6AddressForIngress(svc, baseIPv6)
-	if ipv6Addr != "" {
-		ingress = append(ingress, corev1.LoadBalancerIngress{
-			IP:     ipv6Addr,
-			IPMode: &ipMode,
-		})
-	}
-
-	// Then append all IPv4 Floating IPs.
-	for _, fip := range fips {
-		if fip != nil && fip.IP != nil && fip.IP.To4() != nil {
-			ingress = append(ingress, corev1.LoadBalancerIngress{
-				IP:     fip.IP.String(),
-				IPMode: &ipMode,
-			})
-		}
-	}
-
-	return ingress
 }

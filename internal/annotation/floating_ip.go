@@ -23,14 +23,6 @@ const (
 	// Default: false
 	FIPIPv6 Name = "floating-ip.hetzner.cloud/ipv6"
 
-	// FIPIPv6Address is the IPv6 address to use in load balancer ingress when
-	// using Floating IPs only (e.g. load balancer disabled). If unset or
-	// invalid, "::1" is used. Annotation values must be strings.
-	//
-	// Type: string
-	// Default: "::1"
-	FIPIPv6Address Name = "floating-ip.hetzner.cloud/ipv6-address"
-
 	// FIPLocation is the Hetzner location for the Floating IP (e.g. nbg1,
 	// fsn1, hel1). Required when FIP is enabled, or use the default from
 	// HCLOUD_FLOATING_IP_LOCATION. Floating IPs can only be attached to
@@ -59,15 +51,6 @@ const (
 	//
 	// Type: string
 	FIPNameIPv6 Name = "floating-ip.hetzner.cloud/name-ipv6"
-
-	// FIPIPv6AutoAllocate enables automatic allocation of a unique IPv6 address
-	// from the Floating IP's /64 network for each Service. When enabled, it
-	// overrides FIPIPv6Address. Each Service gets a deterministic address
-	// derived from its UID.
-	//
-	// Type: bool
-	// Default: false
-	FIPIPv6AutoAllocate Name = "floating-ip.hetzner.cloud/ipv6-auto-allocate"
 
 	// FIPPublicIP is the public IP address of the Floating IP. Set by the
 	// Cloud Controller Manager.

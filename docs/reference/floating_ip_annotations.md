@@ -3,7 +3,7 @@
 When using a Service of type `LoadBalancer`, you can enable optional Floating IP management so that the Cloud Controller Manager creates a Hetzner Cloud Floating IP and attaches it to one of the service's target nodes (e.g. a node running an ingress controller pod). If that node is down, the Floating IP is reassigned to another Ready node in the **same location**. Floating IPs are location-bound (e.g. a Floating IP in `nbg1` can only be attached to servers in `nbg1`).
 
 - Read-only annotations are set by the Cloud Controller Manager.
-- The Floating IP address is also exposed in the Service's `status.loadBalancer.ingress`.
+- The CCM only attaches the Floating IP to a node (external routing). It never publishes the Floating IP as the Service's IP — another controller (e.g. MetalLB) manages the in-cluster Service IP.
 - **Kubernetes annotations accept only string values.** For boolean-like options use the strings `"true"` or `"false"`, not unquoted `true`/`false` (which would make Helm/Kubernetes reject the manifest).
 
 | Name | Type | Default | Read-only | Description |
@@ -11,8 +11,6 @@ When using a Service of type `LoadBalancer`, you can enable optional Floating IP
 | `floating-ip.hetzner.cloud/enabled` | `bool` | `false` | `No` | Enables Floating IP management; when `true` alone, an IPv4 Floating IP is created. Prefer `ipv4`/`ipv6` to choose type(s). |
 | `floating-ip.hetzner.cloud/ipv4` | `bool` | `false` | `No` | Request an IPv4 Floating IP. Can be used together with `ipv6`; both are then always attached to the same node. |
 | `floating-ip.hetzner.cloud/ipv6` | `bool` | `false` | `No` | Request an IPv6 Floating IP. Can be used together with `ipv4`; both are then always attached to the same node. |
-| `floating-ip.hetzner.cloud/ipv6-address` | `string` | `::1` | `No` | IPv6 address to use in load balancer ingress when using Floating IPs only (e.g. with load balancer disabled). If unset or invalid, `::1` is used. Ignored when `ipv6-auto-allocate` is `true`. |
-| `floating-ip.hetzner.cloud/ipv6-auto-allocate` | `bool` | `false` | `No` | Automatically allocates a unique IPv6 address from the Floating IP's `/64` network for each Service, derived deterministically from the Service UID. Overrides `ipv6-address`. Useful with MetalLB to avoid address conflicts. |
 | `floating-ip.hetzner.cloud/location` | `string` | `-` | `No` | Hetzner location for the Floating IP (e.g. `nbg1`, `fsn1`, `hel1`). Required when enabled unless `HCLOUD_FLOATING_IP_LOCATION` is set. The IP can only be attached to servers in this location. |
 | `floating-ip.hetzner.cloud/name` | `string` | `-` | `No` | Name to assign to all Floating IPs. Falls back to IP address if unset. Overridden by `name-ipv4`/`name-ipv6`. |
 | `floating-ip.hetzner.cloud/name-ipv4` | `string` | `-` | `No` | Name for the IPv4 Floating IP specifically. Overrides the generic `name` annotation. |
